@@ -10,22 +10,29 @@ module turbos::liquidity_manager {
     use sui::balance::{Self, Balance, Supply};
     use sui::tx_context::{Self, TxContext};
     use sui::vec_map::{Self, VecMap};
-	use turbos::vault::{Self, Vault, Pool}
+	use turbos::vault::{Self, Vault, Pool};
+
+    const EInsufficientTusdOutput: u64 = 0;
+	const EInsufficientTlpOutput: u64 = 0;
 
 
-    const PRICE_PRECISION:u64 = {math::pow(10, 8)};
-    const GLP_PRECISION:u64 = math::pow(10, 18);
-    const USDG_DECIMALS:u64 = 18;
+    const PRICE_PRECISION:u64 = 100000000;
+    const GLP_PRECISION:u64 = 1000000000000000000;
+    const TUSD_DECIMALS:u64 = 18;
     const BASIS_POINTS_DIVISOR:u64 = 10000;
 
-    entry fun add_liquidity<T>(vault: &mut Vault, pool: &mut Pool<T>, token: Coin<T>, ctx: &mut TxContext) {
+	struct Manager has key {
+
+	}
+
+    entry fun add_liquidity<T>(vault: &mut Vault, pool: &mut Pool<T>, token: Coin<T>, min_tusd: u64, min_tlp: u64, ctx: &mut TxContext) {
         transfer::transfer(
-            _add_liquidity(vault, pool, token, ctx),
+            add_liquidity_(vault, pool, token, ctx),
             tx_context::sender(ctx)
         );
     }
 
-    fun _add_liquidity<T>(vault: &mut Vault, pool: &mut Pool<T>, token: Coin<T>, ctx: &mut TxContext): Coin<TLP> {
+    fun add_liquidity_<T>(vault: &mut Vault, pool: &mut Pool<T>, token: Coin<T>, min_tusd: u64, min_tlp: u64, ctx: &mut TxContext): Coin<TLP> {
         // calcalate AUM
         let aum_in_usd = get_aum_in_usd(vault, object::id_address(&token));
         let tlp_supply = balance::supply_value(&vault.tlp_supply);
@@ -33,9 +40,12 @@ module turbos::liquidity_manager {
         let token_balance = coin::into_balance(token);
 		balance::join(&mut pool.token, token_balance);
 
-		let tusd_amount = vault.buy_tusd(vault, token, ctx);
+		// buy from vault
+		let tusd_amount = vault::buy_tusd(vault, token, ctx);
+		assert!(tusd_amount > min_tusd, EInsufficientTusdOutput);
 
 		let mint_amount = if(aum_in_usd == 0) tusd_amount else tusd_amount * tlp_supply / aum_in_usd;
+		assert!(mint_amount > min_tlp, EInsufficientTlpOutput);
 
         let balance = balance::increase_supply(&mut vault.tlp_supply, mint_amount);
 
@@ -44,7 +54,7 @@ module turbos::liquidity_manager {
 
 	fun get_aum_in_usd(vault: &mut Vault, token: address): u64 {
         let aum = get_aum(vault, object::id_address(&token));
-        return aum * math::pow(10 ** USDG_DECIMALS).div(PRICE_PRECISION);
+        aum * math::pow(10 ** TUSD_DECIMALS) / PRICE_PRECISION
     }
 
     fun get_aum(vault: &mut Vault, token: address): u64 {
