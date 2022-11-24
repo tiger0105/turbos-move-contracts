@@ -19,16 +19,36 @@ module turbos::vault {
     const EInvalidAmountIn: u64 =3;
     const EInvalidAmountOut: u64 =4;
     const EInvalidTusdAmount: u64 = 5;
-    /** errors end*/
-
+    const EInvalidMaxLeverage: u64 = 6;
+    const EInvalidTaxBasisPoint: u64 = 7;
+    const EInvalidStableTaxBasisPoints: u64 = 8;
+    const EInvalidMintBurnFeeBasisPoints: u64 = 9;
+    const EInvalidSwapFeeBasisPoints: u64 = 10;
+    const EInvalidStableSwapFeeBasisPoints: u64 = 11;
+    const EInvalidMarginFeeBasisPoints: u64 = 12;
+    const EInvalidLiquidationFeeUsd: u64 = 13;
+    const EInvalidFundingInterval: u64 = 14;
+    const EInvalidFundingRateFactor: u64 = 15;
+    const EInvalidStableFundingRateFactor: u64 = 16;
+    /** errors end */
+    
+    /** constants */
+    const MAX_FEE_BASIS_POINTS: u64 = 500; //5%
+    const MIN_FUNDING_RATE_INTERVAL: u64 = 3600; //1 hours
+    const MAX_FUNDING_RATE_FACTOR: u64 = 10000; //1%
     const PRICE_PRECISION: u64 = 100000000;
     const GLP_PRECISION: u64 = 1000000000000000000;
     const TUSD_DECIMALS: u8 = 18;
     const TUSD_ADDRESS: address = @0x1;
     const BASIS_POINTS_DIVISOR: u64 = 10000;
+    const MAX_LIQUIDATION_FEE_USD: u64 = 100000000000; // 100 usd decimals: 9
+    /** constants end */
 
     /// Coin<TLP> is the token used to mark the liquidity pool share.
     struct TLP has drop { }
+
+    /// Belongs to the creator of the vault.
+    struct ManagerCap has key, store { id: UID }
 
     struct Positions has key, store {
         id: UID,
@@ -60,7 +80,7 @@ module turbos::vault {
         aum_deduction: u64,
 
         is_swap_enabled: bool,
-        whitelisted_token_count: u64,
+        white_listed_token_count: u64,
         // default: 50 * 10000 50x
         max_leverage: u64, 
 
@@ -78,7 +98,7 @@ module turbos::vault {
         stable_swap_fee_basis_points: u64,
         // default: 10 | 0.1%
         margin_fee_basis_points: u64,
-
+        // default: 0
         min_profit_time: u64,
         // default: false
         has_dynamic_fees: bool,
@@ -88,6 +108,7 @@ module turbos::vault {
         funding_interval: u64,
         funding_rate_factor: u64,
         stable_funding_rate_factor: u64,
+
         total_token_weights: u64,
 
         ///token
@@ -100,9 +121,9 @@ module turbos::vault {
 
         // tokenWeights allows customisation of index composition
         token_weights: VecMap<address, u64>, 
-        // tusdAmounts tracks the amount of USDG debt for each whitelisted token
+        // tusdAmounts tracks the amount of TUSD debt for each whitelisted token
         tusd_amounts: VecMap<address, u64>,
-        // maxUsdgAmounts allows setting a max amount of USDG debt for a token
+        // maxTusdAmounts allows setting a max amount of TUSD debt for a token
         max_tusd_amounts: VecMap<address, u64>,
         // poolAmounts tracks the number of received tokens that can be used for leverage
         // this is tracked separately from tokenBalances to exclude funds that are deposited as margin collateral
@@ -113,7 +134,7 @@ module turbos::vault {
         // this can be used to ensure a certain amount of liquidity is available for leverage positions
         buffer_amounts: VecMap<address, u64>,
         // guaranteedUsd tracks the amount of USD that is "guaranteed" by opened leverage positions
-        // this value is used to calculate the redemption values for selling of USDG
+        // this value is used to calculate the redemption values for selling of TUSD
         // this is an estimated amount, it is possible for the actual guaranteed value to be lower
         // in the case of sudden price decreases, the guaranteed value should be corrected
         // after liquidations are carried out
@@ -175,11 +196,12 @@ module turbos::vault {
         amount: u64,
     }
 
-    fun init(_: &mut TxContext) {}
+    //fun init(_: &mut TxContext) {}
 
-    public fun create_vault(witness: TLP, ctx: &mut TxContext) {
-        let tlp_supply = balance::create_supply<TLP>(witness);
+    fun init(ctx: &mut TxContext) {
+        transfer::transfer(ManagerCap { id: object::new(ctx) }, tx_context::sender(ctx));
 
+        let tlp_supply = balance::create_supply(TLP {});
         let vault = Vault {
             id: object::new(ctx),
             tlp_supply,
@@ -187,7 +209,7 @@ module turbos::vault {
             is_swap_enabled: false,
             aum_addition: 0,
             aum_deduction: 0, 
-            whitelisted_token_count: 0,
+            white_listed_token_count: 0,
             max_leverage: 50, 
             liquidation_fee_usd: 2, //todo 2usd
             tax_basis_points: 50,
@@ -226,14 +248,14 @@ module turbos::vault {
         transfer::share_object(vault);
     }
 
-    entry fun add_liquidity<T>(vault: &mut Vault, pool: &mut Pool<T>, token: Coin<T>, min_tusd: u64, min_tlp: u64, ctx: &mut TxContext) {
-        transfer::transfer(
-            add_liquidity_(vault, pool, token, min_tusd, min_tlp, ctx),
-            tx_context::sender(ctx)
-        );
-    }
-
-    fun add_liquidity_<T>(vault: &mut Vault, pool: &mut Pool<T>, token: Coin<T>, min_tusd: u64, min_tlp: u64, ctx: &mut TxContext):  Coin<TLP> {
+    entry fun add_liquidity<T>(
+        vault: &mut Vault, 
+        pool: &mut Pool<T>, 
+        token: Coin<T>, 
+        min_tusd: u64, 
+        min_tlp: u64, 
+        ctx: &mut TxContext
+    ) {
         // calcalate AUM
         let aum_in_tusd = get_aum_in_tusd(vault, true);
         let tlp_supply = balance::supply_value(&vault.tlp_supply);
@@ -258,7 +280,116 @@ module turbos::vault {
         *last_liquidity_added_at = *last_liquidity_added_at + tx_context::epoch(ctx);
         event::emit(AddLiquidityEvent { account: tx_context::sender(ctx), token: token_address, amount: token_amount, aum_in_tusd, tlp_supply, tusd_amount, mint_amount });
 
-        coin::from_balance(balance, ctx)
+        let balance = coin::from_balance(balance, ctx);
+
+        transfer::transfer(
+            balance,
+            tx_context::sender(ctx)
+        );
+    }
+
+    entry fun set_fees(
+        _: &ManagerCap,
+        vault: &mut Vault,
+        tax_basis_points: u64,
+        stable_tax_basis_points: u64,
+        mint_burn_fee_basis_points: u64,
+        swap_fee_basis_points: u64,
+        stable_swap_fee_basis_points: u64,
+        margin_fee_basis_points: u64,
+        liquidation_fee_usd: u64,
+        min_profit_time: u64,
+        has_dynamic_fees: bool,
+        ctx: &mut TxContext
+    ) {
+        assert!(tax_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidTaxBasisPoint);
+        assert!(stable_tax_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidStableTaxBasisPoints);
+        assert!(mint_burn_fee_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidMintBurnFeeBasisPoints);
+        assert!(swap_fee_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidSwapFeeBasisPoints);
+        assert!(stable_swap_fee_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidStableSwapFeeBasisPoints);
+        assert!(margin_fee_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidMarginFeeBasisPoints);
+        assert!(liquidation_fee_usd <= MAX_LIQUIDATION_FEE_USD, EInvalidLiquidationFeeUsd);
+
+        vault.tax_basis_points = tax_basis_points;
+        vault.stable_tax_basis_points = stable_tax_basis_points;
+        vault.mint_burn_fee_basis_points = mint_burn_fee_basis_points;
+        vault.swap_fee_basis_points = swap_fee_basis_points;
+        vault.stable_swap_fee_basis_points = stable_swap_fee_basis_points;
+        vault.margin_fee_basis_points = margin_fee_basis_points;
+        vault.liquidation_fee_usd = liquidation_fee_usd;
+        vault.min_profit_time = min_profit_time;
+        vault.has_dynamic_fees = has_dynamic_fees;
+    }
+
+    entry fun set_funding_rate(
+        _: &ManagerCap,
+        vault: &mut Vault,
+        funding_interval: u64,
+        funding_rate_factor: u64,
+        stable_funding_rate_factor: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(funding_interval >= MIN_FUNDING_RATE_INTERVAL, EInvalidFundingInterval);
+        assert!(funding_rate_factor <= MAX_FUNDING_RATE_FACTOR, EInvalidFundingRateFactor);
+        assert!(stable_funding_rate_factor <= MAX_FUNDING_RATE_FACTOR, EInvalidStableFundingRateFactor);
+        
+        vault.funding_interval = funding_interval;
+        vault.funding_rate_factor = funding_rate_factor;
+        vault.stable_funding_rate_factor = stable_funding_rate_factor;
+    }
+
+    entry fun set_token_config(
+        _: &ManagerCap,
+        vault: &mut Vault,
+        token: address,
+        token_decimals: u8,
+        token_weights: u64,
+        min_profit_basis_points: u64,
+        is_stable: bool,
+        is_shortable: bool,
+        ctx: &mut TxContext
+    ) {
+       let is_listed = vec_map::contains(&vault.white_listed_tokens, &token); 
+       if (!is_listed) {
+            vault.white_listed_token_count = vault.white_listed_token_count + 1;
+            vector::push_back(&mut  vault.all_whitelisted_tokens, token);
+            vec_map::insert(&mut vault.white_listed_tokens, token, true);
+            vec_map::insert(&mut vault.token_decimals, token, token_decimals);
+            vec_map::insert(&mut vault.token_weights, token, token_weights);
+            vec_map::insert(&mut vault.min_profit_basis_points, token, min_profit_basis_points);
+            vec_map::insert(&mut vault.stable_tokens, token, is_stable);
+            vec_map::insert(&mut vault.shortable_tokens, token, is_shortable);
+
+            vault.total_token_weights = vault.total_token_weights + token_weights;
+       } else {
+            let current_total_token_weights = vault.total_token_weights - *vec_map::get(&vault.token_weights, &token);
+            // update token config
+            *vec_map::get_mut(&mut vault.token_decimals, &token) = token_decimals;
+            *vec_map::get_mut(&mut vault.token_weights, &token) = token_weights;
+            *vec_map::get_mut(&mut vault.min_profit_basis_points, &token) = min_profit_basis_points;
+            *vec_map::get_mut(&mut vault.stable_tokens, &token) = is_stable;
+            *vec_map::get_mut(&mut vault.shortable_tokens, &token) = is_shortable;
+            current_total_token_weights = current_total_token_weights + token_weights;
+            vault.total_token_weights = current_total_token_weights;
+       }
+    }
+
+    entry fun clear_token_config(
+        _: &ManagerCap,
+        vault: &mut Vault,
+        token: address,
+        ctx: &mut TxContext
+    ) {
+        let is_listed = vec_map::contains(&vault.white_listed_tokens, &token); 
+        assert!(is_listed, ETokenNotWhiteListed);
+
+        vault.total_token_weights = vault.total_token_weights - *vec_map::get(&vault.token_weights, &token);
+        vec_map::remove(&mut vault.token_decimals, &token);
+        vec_map::remove(&mut vault.token_weights, &token);
+        vec_map::remove(&mut vault.min_profit_basis_points, &token);
+        vec_map::remove(&mut vault.stable_tokens, &token);
+        vec_map::remove(&mut vault.shortable_tokens, &token);
+        vault.white_listed_token_count = vault.white_listed_token_count - 1;
     }
 
 	fun get_aum_in_tusd(vault: &mut Vault, maximise: bool): u64 {
@@ -466,14 +597,14 @@ module turbos::vault {
 		point
     }
 
-	fun get_fee_basis_points(vault: &Vault, token: address, usdg_delta: u64 ,fee_basis_points: u64, tax_basis_points: u64, increment: bool): u64 {
+	fun get_fee_basis_points(vault: &Vault, token: address, tusd_delta: u64 ,fee_basis_points: u64, tax_basis_points: u64, increment: bool): u64 {
 		let has_dynamic_fees = vault.has_dynamic_fees;
-        if (has_dynamic_fees) { return fee_basis_points };
+        if (!has_dynamic_fees) { return fee_basis_points };
 
         let initial_amount = *vec_map::get(&vault.tusd_amounts, &token);
-        let next_amount = initial_amount + usdg_delta;
+        let next_amount = initial_amount + tusd_delta;
         if (!increment) {
-            next_amount = if(usdg_delta > initial_amount) 0 else initial_amount - usdg_delta;
+            next_amount = if(tusd_delta > initial_amount) 0 else initial_amount - tusd_delta;
         };
 
         let target_amount = get_target_tusd_amount(vault, token);
