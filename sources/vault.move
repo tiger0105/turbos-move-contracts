@@ -6,16 +6,17 @@ module turbos::vault {
     use sui::event;
     use std::vector;
     use sui::transfer;
-    use sui::object::{Self, UID};
+    use sui::object::{Self, UID, ID};
     use sui::coin::{Self, Coin};
     use sui::balance::{Self, Balance, Supply};
     use sui::tx_context::{Self, TxContext};
     use sui::vec_map::{Self, VecMap};
+    use sui::dynamic_object_field as dof;
 
     /** errors */
     const EInsufficientTusdOutput: u64 = 0;
 	const EInsufficientTlpOutput: u64 = 1;
-    const ETokenNotWhiteListed: u64 = 2;
+    const EPoolNotWhiteListed: u64 = 2;
     const EInvalidAmountIn: u64 =3;
     const EInvalidAmountOut: u64 =4;
     const EInvalidTusdAmount: u64 = 5;
@@ -30,6 +31,7 @@ module turbos::vault {
     const EInvalidFundingInterval: u64 = 14;
     const EInvalidFundingRateFactor: u64 = 15;
     const EInvalidStableFundingRateFactor: u64 = 16;
+    const EPoolNotCreated: u64 = 17;
     /** errors end */
     
     /** constants */
@@ -110,75 +112,71 @@ module turbos::vault {
         stable_funding_rate_factor: u64,
 
         total_token_weights: u64,
+    }
 
-        ///token
-        all_whitelisted_tokens: vector<address>,
-        white_listed_tokens: VecMap<address, bool>,
-        token_decimals: VecMap<address, u8>,
-        min_profit_basis_points: VecMap<address, u64>,
-        stable_tokens: VecMap<address, bool>,
-        shortable_tokens: VecMap<address, bool>,
-
+    struct Pool<phantom T> has key, store {
+        id: UID,
+        token: Balance<T>,
+        token_decimals: u8,
+        min_profit_basis_points: u64,
+        is_white_listed: bool,
+        is_stable_token: bool,
+        is_shortable_token: bool,
         // tokenWeights allows customisation of index composition
-        token_weights: VecMap<address, u64>, 
+        token_weights: u64, 
         // tusdAmounts tracks the amount of TUSD debt for each whitelisted token
-        tusd_amounts: VecMap<address, u64>,
+        tusd_amounts: u64,
         // maxTusdAmounts allows setting a max amount of TUSD debt for a token
-        max_tusd_amounts: VecMap<address, u64>,
+        max_tusd_amounts: u64,
         // poolAmounts tracks the number of received tokens that can be used for leverage
         // this is tracked separately from tokenBalances to exclude funds that are deposited as margin collateral
-        pool_amounts: VecMap<address, u64>,
+        pool_amounts: u64,
         // reservedAmounts tracks the number of tokens reserved for open leverage positions
-        reserved_amounts: VecMap<address, u64>,
+        reserved_amounts: u64,
         // bufferAmounts allows specification of an amount to exclude from swaps
         // this can be used to ensure a certain amount of liquidity is available for leverage positions
-        buffer_amounts: VecMap<address, u64>,
+        buffer_amounts: u64,
         // guaranteedUsd tracks the amount of USD that is "guaranteed" by opened leverage positions
         // this value is used to calculate the redemption values for selling of TUSD
         // this is an estimated amount, it is possible for the actual guaranteed value to be lower
         // in the case of sudden price decreases, the guaranteed value should be corrected
         // after liquidations are carried out
-        guaranteed_usd: VecMap<address, u64>,
+        guaranteed_usd: u64,
 
         // cumulativeFundingRates tracks the funding rates based on utilization
-        cumulative_funding_rates: VecMap<address, u64>,
+        cumulative_funding_rates: u64,
         // lastFundingTimes tracks the last time funding was updated for a token
-        last_funding_times: VecMap<address, u64>,
+        last_funding_times: u64,
         // feeReserves tracks the amount of fees per token
-        fee_reserves: VecMap<address, u64>,
-        global_short_sizes: VecMap<address, u64>,
-        global_short_average_prices: VecMap<address, u64>,
-        max_global_short_sizes: VecMap<address, u64>,
-        last_liquidity_added_at: VecMap<address, u64>,
-    }
-
-    struct Pool<phantom T> has key {
-        id: UID,
-        token: Balance<T>,
+        fee_reserves: u64,
+        global_short_sizes: u64,
+        global_short_average_prices: u64,
+        max_global_short_sizes: u64,
+        last_liquidity_added_at: u64,
     }
 
     struct BuyTUSDEvent has copy, drop {
         receiver: address,
-        token: address,
+        pool: ID,
         token_amount: u64,
         mint_amount: u64,
         fee_basis_points: u64,
     }
 
     struct CollectSwapFeesEvent has copy, drop {
-        token: address,
+        pool: ID,
         fee_in_usd: u64,
         fee_token_amount: u64,
     }
     
     struct UpdateFundingRateEvent has copy, drop {
-        collateral_token: address,
+        pool: ID,
         cumulative_funding_rates: u64,
     }
 
     struct AddLiquidityEvent has copy, drop {
         account: address, 
-        token: address, 
+        pool: ID,
         amount: u64,
         aum_in_tusd: u64, 
         tlp_supply: u64,
@@ -187,12 +185,12 @@ module turbos::vault {
     }
 
     struct IncreaseTusdAmountEvent has copy, drop {
-        token: address, 
+        pool: ID,
         amount: u64,
     }
 
     struct IncreasePoolAmountEvent has copy, drop {
-        token: address, 
+        pool: ID,
         amount: u64,
     }
 
@@ -224,28 +222,46 @@ module turbos::vault {
             funding_rate_factor: 100,
             stable_funding_rate_factor: 100,
             total_token_weights: 0,
-            all_whitelisted_tokens: vector::empty(),
-            white_listed_tokens: vec_map::empty(),
-            token_decimals: vec_map::empty(),
-            min_profit_basis_points: vec_map::empty(),
-            stable_tokens: vec_map::empty(),
-            shortable_tokens: vec_map::empty(),
-            token_weights: vec_map::empty(),
-            tusd_amounts: vec_map::empty(),
-            max_tusd_amounts: vec_map::empty(),
-            pool_amounts: vec_map::empty(),
-            reserved_amounts: vec_map::empty(),
-            buffer_amounts: vec_map::empty(),
-            guaranteed_usd: vec_map::empty(),
-            cumulative_funding_rates: vec_map::empty(),
-            last_funding_times: vec_map::empty(),
-            fee_reserves: vec_map::empty(),
-            global_short_sizes: vec_map::empty(),
-            global_short_average_prices: vec_map::empty(),
-            max_global_short_sizes: vec_map::empty(),
-            last_liquidity_added_at: vec_map::empty(),
         };
         transfer::share_object(vault);
+    }
+
+    entry fun create_pool<T> (
+        _: &ManagerCap,
+        vault: &mut Vault, 
+        token_decimals: u8,
+        min_profit_basis_points: u64,
+        is_stable_token: bool,
+        is_shortable_token: bool,
+        token_weights: u64, 
+        max_tusd_amounts: u64,
+        ctx: &mut TxContext
+    ) {
+        let pool = Pool { 
+            id: object::new(ctx),
+            token: balance::zero<T>(),
+            token_decimals,
+            min_profit_basis_points,
+            is_white_listed: true,
+            is_stable_token,
+            is_shortable_token,
+            token_weights, 
+            tusd_amounts: 0,
+            max_tusd_amounts,
+            pool_amounts: 0,
+            reserved_amounts: 0,
+            buffer_amounts: 0,
+            guaranteed_usd: 0,
+            cumulative_funding_rates: 0,
+            last_funding_times: 0,
+            fee_reserves: 0,
+            global_short_sizes: 0,
+            global_short_average_prices: 0,
+            max_global_short_sizes: 0,
+            last_liquidity_added_at: 0,
+        };
+        transfer::share_object(pool);
+        //vector::push_back(&mut vault.pools, pool_id);
     }
 
     entry fun add_liquidity<T>(
@@ -256,19 +272,21 @@ module turbos::vault {
         min_tlp: u64, 
         ctx: &mut TxContext
     ) {
-        // calcalate AUM
-        let aum_in_tusd = get_aum_in_tusd(vault, true);
-        let tlp_supply = balance::supply_value(&vault.tlp_supply);
+        assert!(pool.is_white_listed, EPoolNotWhiteListed);
 
-        let token_address = object::id_address(&token);
         let token_balance = coin::into_balance(token);
         let token_amount = balance::value(&token_balance);
         assert!(token_amount > 0, EInvalidAmountIn);
-		balance::join(&mut pool.token, token_balance);
 
 		// buy tusd from vault
-		let tusd_amount = buy_tusd(vault, token_address, token_amount, ctx);
+		let tusd_amount = buy_tusd(vault, pool, token_amount, ctx);
 		assert!(tusd_amount > min_tusd, EInsufficientTusdOutput);
+
+        // todo get aum from oracle
+        let aum_in_tusd = 0;
+        let tlp_supply = balance::supply_value(&vault.tlp_supply);
+
+		balance::join(&mut pool.token, token_balance);
 
 		let mint_amount = if(aum_in_tusd == 0) tusd_amount else tusd_amount * tlp_supply / aum_in_tusd;
 		assert!(mint_amount > min_tlp, EInsufficientTlpOutput);
@@ -276,9 +294,8 @@ module turbos::vault {
         // increase glp supply
         let balance = balance::increase_supply(&mut vault.tlp_supply, mint_amount);
 
-        let last_liquidity_added_at = vec_map::get_mut(&mut vault.last_liquidity_added_at, &token_address);
-        *last_liquidity_added_at = *last_liquidity_added_at + tx_context::epoch(ctx);
-        event::emit(AddLiquidityEvent { account: tx_context::sender(ctx), token: token_address, amount: token_amount, aum_in_tusd, tlp_supply, tusd_amount, mint_amount });
+        pool.last_liquidity_added_at = pool.last_liquidity_added_at + tx_context::epoch(ctx);
+        event::emit(AddLiquidityEvent { account: tx_context::sender(ctx), pool: object::id(pool), amount: token_amount, aum_in_tusd, tlp_supply, tusd_amount, mint_amount });
 
         let balance = coin::from_balance(balance, ctx);
 
@@ -338,276 +355,238 @@ module turbos::vault {
         vault.stable_funding_rate_factor = stable_funding_rate_factor;
     }
 
-    entry fun set_token_config(
+    entry fun set_pool_config<T>(
         _: &ManagerCap,
         vault: &mut Vault,
-        token: address,
+        pool_id: ID,
         token_decimals: u8,
-        token_weights: u64,
         min_profit_basis_points: u64,
-        is_stable: bool,
-        is_shortable: bool,
+        is_stable_token: bool,
+        is_shortable_token: bool,
+        token_weights: u64, 
+        max_tusd_amounts: u64,
         ctx: &mut TxContext
     ) {
-       let is_listed = vec_map::contains(&vault.white_listed_tokens, &token); 
-       if (!is_listed) {
-            vault.white_listed_token_count = vault.white_listed_token_count + 1;
-            vector::push_back(&mut  vault.all_whitelisted_tokens, token);
-            vec_map::insert(&mut vault.white_listed_tokens, token, true);
-            vec_map::insert(&mut vault.token_decimals, token, token_decimals);
-            vec_map::insert(&mut vault.token_weights, token, token_weights);
-            vec_map::insert(&mut vault.min_profit_basis_points, token, min_profit_basis_points);
-            vec_map::insert(&mut vault.stable_tokens, token, is_stable);
-            vec_map::insert(&mut vault.shortable_tokens, token, is_shortable);
+        let is_pool_created = dof::exists_<ID>(&vault.id, pool_id);
+        assert!(is_pool_created, EPoolNotCreated);
 
-            vault.total_token_weights = vault.total_token_weights + token_weights;
-       } else {
-            let current_total_token_weights = vault.total_token_weights - *vec_map::get(&vault.token_weights, &token);
-            // update token config
-            *vec_map::get_mut(&mut vault.token_decimals, &token) = token_decimals;
-            *vec_map::get_mut(&mut vault.token_weights, &token) = token_weights;
-            *vec_map::get_mut(&mut vault.min_profit_basis_points, &token) = min_profit_basis_points;
-            *vec_map::get_mut(&mut vault.stable_tokens, &token) = is_stable;
-            *vec_map::get_mut(&mut vault.shortable_tokens, &token) = is_shortable;
-            current_total_token_weights = current_total_token_weights + token_weights;
-            vault.total_token_weights = current_total_token_weights;
-       }
+        let pool = dof::borrow_mut<ID, Pool<T>>(&mut vault.id, pool_id);
+        pool.token_decimals = token_decimals;
+        pool.min_profit_basis_points = min_profit_basis_points;
+        pool.is_stable_token = is_stable_token;
+        pool.is_shortable_token = is_shortable_token;
+        pool.token_weights = token_weights;
+        pool.max_tusd_amounts = max_tusd_amounts;
     }
 
-    entry fun clear_token_config(
-        _: &ManagerCap,
-        vault: &mut Vault,
-        token: address,
-        ctx: &mut TxContext
-    ) {
-        let is_listed = vec_map::contains(&vault.white_listed_tokens, &token); 
-        assert!(is_listed, ETokenNotWhiteListed);
+	// fun get_aum_in_tusd(vault: &mut Vault, maximise: bool): u64 {
+    //     let aum = get_aum(vault, maximise);
+    //     aum * math::pow(10 , TUSD_DECIMALS) / PRICE_PRECISION
+    // }
 
-        vault.total_token_weights = vault.total_token_weights - *vec_map::get(&vault.token_weights, &token);
-        vec_map::remove(&mut vault.token_decimals, &token);
-        vec_map::remove(&mut vault.token_weights, &token);
-        vec_map::remove(&mut vault.min_profit_basis_points, &token);
-        vec_map::remove(&mut vault.stable_tokens, &token);
-        vec_map::remove(&mut vault.shortable_tokens, &token);
-        vault.white_listed_token_count = vault.white_listed_token_count - 1;
-    }
+    // fun get_aum(vault: &mut Vault, maximise: bool): u64 {
+    //     let len = vector::length(&vault.all_whitelisted_tokens);
+    //     let aum = vault.aum_addition;
+    //     let aum_deduction = vault.aum_deduction;
+    //     let short_profits = 0;
+    //     let i = 0;
+    //     while (i < len) {
+    //         i = i + 1;
+    //         let token = *vector::borrow(&vault.all_whitelisted_tokens, i);
+    //         let is_whitelisted = *vec_map::get(&vault.white_listed_tokens, &token);
+    //         if (is_whitelisted) {
+    //             continue
+    //         };
 
-	fun get_aum_in_tusd(vault: &mut Vault, maximise: bool): u64 {
-        let aum = get_aum(vault, maximise);
-        aum * math::pow(10 , TUSD_DECIMALS) / PRICE_PRECISION
-    }
+    //         let price = if (maximise) get_max_price(vault, token) else get_min_price(vault, token);
+    //         let pool_amount = *vec_map::get(&vault.pool_amounts, &token);
+    //         let decimals = *vec_map::get(&vault.token_decimals, &token);
 
-    fun get_aum(vault: &mut Vault, maximise: bool): u64 {
-        let len = vector::length(&vault.all_whitelisted_tokens);
-        let aum = vault.aum_addition;
-        let aum_deduction = vault.aum_deduction;
-        let short_profits = 0;
-        let i = 0;
-        while (i < len) {
-            i = i + 1;
-            let token = *vector::borrow(&vault.all_whitelisted_tokens, i);
-            let is_whitelisted = *vec_map::get(&vault.white_listed_tokens, &token);
-            if (is_whitelisted) {
-                continue
-            };
+    //         if (*vec_map::get(&vault.stable_tokens, &token)) {
+    //             aum = aum + (pool_amount * price / math::pow(10, decimals));
+    //         } else {
+    //             let size = *vec_map::get(&vault.global_short_sizes, &token);
+    //             if (size > 0) {
+    //                 let (delta, has_profit) = get_global_short_delta(vault, token, price, size);
+    //                 if (!has_profit) {
+    //                     // add losses from shorts
+    //                     aum = aum + delta;
+    //                 } else {
+    //                     short_profits = short_profits + delta;
+    //                 };
+    //             };
 
-            let price = if (maximise) get_max_price(vault, token) else get_min_price(vault, token);
-            let pool_amount = *vec_map::get(&vault.pool_amounts, &token);
-            let decimals = *vec_map::get(&vault.token_decimals, &token);
+    //             let guaranteed_usd = *vec_map::get(&vault.guaranteed_usd, &token);
+    //             aum = aum + guaranteed_usd;
 
-            if (*vec_map::get(&vault.stable_tokens, &token)) {
-                aum = aum + (pool_amount * price / math::pow(10, decimals));
-            } else {
-                let size = *vec_map::get(&vault.global_short_sizes, &token);
-                if (size > 0) {
-                    let (delta, has_profit) = get_global_short_delta(vault, token, price, size);
-                    if (!has_profit) {
-                        // add losses from shorts
-                        aum = aum + delta;
-                    } else {
-                        short_profits = short_profits + delta;
-                    };
-                };
+    //             let reserved_amount = *vec_map::get(&vault.reserved_amounts, &token);
+    //             aum = aum + ((pool_amount - reserved_amount) * price / math::pow(10, decimals));
+    //         };
+    //     };
 
-                let guaranteed_usd = *vec_map::get(&vault.guaranteed_usd, &token);
-                aum = aum + guaranteed_usd;
+    //     aum = if (short_profits > aum) 0 else (aum - short_profits);
+    //     aum = if (aum_deduction > aum) 0 else (aum - aum_deduction);
+    //     aum
+    // }
 
-                let reserved_amount = *vec_map::get(&vault.reserved_amounts, &token);
-                aum = aum + ((pool_amount - reserved_amount) * price / math::pow(10, decimals));
-            };
-        };
+    // fun get_global_short_delta(vault: &mut Vault, token: address, price: u64, size: u64): (u64, bool) {
+    //     // todo: get price from short tracker 
+    //     let average_price  = *vec_map::get(&vault.global_short_average_prices, &token);
+    //     let priceDelta = if (average_price > price) average_price - price else price - average_price;
+    //     let delta = size * priceDelta / average_price;
+    //     (delta, average_price > price)
+    // }
 
-        aum = if (short_profits > aum) 0 else (aum - short_profits);
-        aum = if (aum_deduction > aum) 0 else (aum - aum_deduction);
-        aum
-    }
-
-    fun get_global_short_delta(vault: &mut Vault, token: address, price: u64, size: u64): (u64, bool) {
-        // todo: get price from short tracker 
-        let average_price  = *vec_map::get(&vault.global_short_average_prices, &token);
-        let priceDelta = if (average_price > price) average_price - price else price - average_price;
-        let delta = size * priceDelta / average_price;
-        (delta, average_price > price)
-    }
-
-    fun buy_tusd(vault: &mut Vault, token: address, token_amount: u64, ctx: &mut TxContext): u64 {
-        assert!(*vec_map::get(&vault.white_listed_tokens, &token), ETokenNotWhiteListed);
+    fun buy_tusd<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, ctx: &mut TxContext): u64 {
         assert!(token_amount > 0, EInvalidAmountIn);
         
-        update_cumulative_funding_rate(vault, token, ctx);
+        update_cumulative_funding_rate<T>(vault, pool, ctx);
 
         // todo: get price from oracle
-        let price = get_min_price(vault, token);
+        let price = get_min_price(vault, pool);
+        let token_decimals = pool.token_decimals;
 
         let tusd_amount = token_amount * price / PRICE_PRECISION;
-        tusd_amount = adjust_for_decimals(vault, tusd_amount, token, TUSD_ADDRESS);
+        tusd_amount = adjust_for_decimals(tusd_amount, token_decimals, TUSD_DECIMALS);
         assert!(tusd_amount > 0, EInvalidTusdAmount);
 
         //todo
-        let fee_basis_points = get_buy_tusd_fee_basis_points(vault, token, tusd_amount);
-        let amount_after_fees = collect_swap_fees(vault, token, token_amount, fee_basis_points);
+        let fee_basis_points = get_buy_tusd_fee_basis_points(vault, pool, tusd_amount);
+        let amount_after_fees = collect_swap_fees(vault, pool, token_amount, fee_basis_points);
         let mint_amount = amount_after_fees * price / PRICE_PRECISION;
-        mint_amount = adjust_for_decimals(vault, mint_amount, token, TUSD_ADDRESS);
+        mint_amount = adjust_for_decimals(mint_amount, token_decimals, TUSD_DECIMALS);
 
-        increase_tusd_amount(vault, token, mint_amount);
-        increase_pool_amount(vault, token, amount_after_fees);
+        increase_tusd_amount(pool, mint_amount);
+        increase_pool_amount(pool, amount_after_fees);
 
         vault.tusd_supply_amount = vault.tusd_supply_amount + mint_amount;
 
-        event::emit(BuyTUSDEvent { receiver: tx_context::sender(ctx), token: token, token_amount, mint_amount, fee_basis_points });
+        event::emit(BuyTUSDEvent { receiver: tx_context::sender(ctx), pool: object::id(pool), token_amount, mint_amount, fee_basis_points });
 
         mint_amount
     }
 
     // todo: change epoch to timestamp
-    fun update_cumulative_funding_rate(vault: &mut Vault, collateral_token: address, ctx: &mut TxContext) {
-        let last_funding_time = *vec_map::get(&vault.last_funding_times, &collateral_token);
+    fun update_cumulative_funding_rate<T>(vault: &mut Vault, pool: &mut Pool<T>, ctx: &mut TxContext) {
+        let last_funding_times = pool.last_funding_times;
         let funding_interval = vault.funding_interval;
-        if (last_funding_time == 0) {
-            let last_funding_time_ref = vec_map::get_mut(&mut vault.last_funding_times, &collateral_token);
-            *last_funding_time_ref = tx_context::epoch(ctx) / funding_interval * funding_interval;
+        if (last_funding_times == 0) {
+            pool.last_funding_times = tx_context::epoch(ctx) / funding_interval * funding_interval;
         } else {
-            if (last_funding_time + funding_interval  > tx_context::epoch(ctx)) {
+            if (last_funding_times + funding_interval  > tx_context::epoch(ctx)) {
                 return
             };
 
-            let funding_rate = get_next_funding_rate(vault, collateral_token, ctx);
+            let funding_rate = get_next_funding_rate<T>(vault, pool, ctx);
 
-            let cumulative_funding_rates = vec_map::get_mut(&mut vault.cumulative_funding_rates, &collateral_token);
-            *cumulative_funding_rates = *cumulative_funding_rates + funding_rate;
-            let last_funding_time_ref = vec_map::get_mut(&mut vault.last_funding_times, &collateral_token);
-            *last_funding_time_ref = tx_context::epoch(ctx) / funding_interval * funding_interval;
+            pool.cumulative_funding_rates = pool.cumulative_funding_rates + funding_rate;
+            pool.last_funding_times = tx_context::epoch(ctx) / funding_interval * funding_interval;
 
-            event::emit(UpdateFundingRateEvent { collateral_token, cumulative_funding_rates: *cumulative_funding_rates });
+            event::emit(UpdateFundingRateEvent { pool: object::id(pool), cumulative_funding_rates: pool.cumulative_funding_rates });
         }
     }
 
-    fun get_next_funding_rate(vault: &Vault, token: address, ctx: &mut TxContext): u64 {
-        let last_funding_times = *vec_map::get(&vault.last_funding_times, &token);
+    fun get_next_funding_rate<T>(vault: &Vault, pool: &Pool<T>, ctx: &mut TxContext): u64 {
+        let last_funding_times = pool.last_funding_times;
         let funding_interval = vault.funding_interval;
         let timestamp = tx_context::epoch(ctx);
         if (last_funding_times + funding_interval > timestamp) { return 0 };
 
         let intervals = (timestamp - last_funding_times) / funding_interval;
-        let pool_amount = *vec_map::get(&vault.pool_amounts, &token);
-        if (pool_amount == 0) { return 0 };
+        let pool_amounts = pool.pool_amounts;
+        if (pool_amounts == 0) { return 0 };
 
-        let is_stable_token = *vec_map::get(&vault.stable_tokens, &token);
+        let is_stable_token = pool.is_stable_token;
         let funding_rate_ractor = if (is_stable_token) vault.stable_funding_rate_factor else vault.funding_rate_factor;
-        let next_funding_rate = funding_rate_ractor * *vec_map::get(&vault.reserved_amounts, &token) * intervals * pool_amount;
+        let next_funding_rate = funding_rate_ractor * pool.reserved_amounts * intervals * pool_amounts;
 
         next_funding_rate
     }
 
-    fun collect_swap_fees(vault: &mut Vault, token: address, token_amount: u64, fee_basis_points: u64): u64 {
+    fun collect_swap_fees<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, fee_basis_points: u64): u64 {
         let after_fee_amount = token_amount * (BASIS_POINTS_DIVISOR - fee_basis_points) / BASIS_POINTS_DIVISOR;
         let fee_amount = token_amount - after_fee_amount;
-        let fee_reserve = vec_map::get_mut(&mut vault.fee_reserves, &token);
-        *fee_reserve = *fee_reserve + fee_amount;
-        event::emit(CollectSwapFeesEvent { token: token, fee_in_usd:token_to_usd_min(vault, token, fee_amount), fee_token_amount:fee_amount });
+        pool.fee_reserves = pool.fee_reserves + fee_amount;
+        event::emit(CollectSwapFeesEvent { pool: object::id(pool), fee_in_usd:token_to_usd_min(vault, pool, fee_amount), fee_token_amount:fee_amount });
 
         after_fee_amount
     }
 
-    fun adjust_for_decimals(vault: &mut Vault, amount: u64, token_div: address, token_mul: address): u64 {
-        let decimals_div = if (token_div == TUSD_ADDRESS) TUSD_DECIMALS else *vec_map::get(&vault.token_decimals, &token_div);
-        let decimals_mul = if (token_mul == TUSD_ADDRESS) TUSD_DECIMALS else *vec_map::get(&vault.token_decimals, &token_mul);
-        let amount = amount * math::pow(10, decimals_mul)/ math::pow(10, decimals_div);
+    fun adjust_for_decimals(amount: u64, token_div_decimals: u8, token_mul_decimals: u8): u64 {
+        let amount = amount * math::pow(10, token_mul_decimals)/ math::pow(10, token_div_decimals);
 
         amount
     }
 
-    fun increase_tusd_amount(vault: &mut Vault, token: address, amount: u64) {
-        let tusd_amount = vec_map::get_mut(&mut vault.tusd_amounts, &token);
-        *tusd_amount = *tusd_amount + amount;
+    fun increase_tusd_amount<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.tusd_amounts = pool.tusd_amounts + amount;
 
-        event::emit(IncreaseTusdAmountEvent { token, amount: *tusd_amount});
+        event::emit(IncreaseTusdAmountEvent { pool: object::id(pool), amount: pool.tusd_amounts});
     }
 
-    fun increase_pool_amount(vault: &mut Vault, token: address, amount: u64) {
-        let pool_amount = vec_map::get_mut(&mut vault.pool_amounts, &token);
-        *pool_amount = *pool_amount + amount;
+    fun increase_pool_amount<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.pool_amounts = pool.pool_amounts + amount;
 
-        event::emit(IncreasePoolAmountEvent { token, amount: *pool_amount});
+        event::emit(IncreasePoolAmountEvent { pool: object::id(pool), amount: pool.pool_amounts});
     }
 
-    fun get_target_tusd_amount(vault: &Vault, token: address): u64 {
+    fun get_target_tusd_amount<T>(vault: &Vault, pool: &Pool<T>): u64 {
         let supply = vault.tusd_supply_amount;
         if (supply == 0) { return 0 };
-        let weight = *vec_map::get(&vault.token_weights, &token);
+        let weight = pool.token_weights;
         let target_weight = weight * supply / vault.total_token_weights;
         target_weight
     }
 
-    fun token_to_usd_min(vault: &mut Vault, token: address, token_amount: u64): u64 {
+    fun token_to_usd_min<T>(vault: &mut Vault, pool: &Pool<T>, token_amount: u64): u64 {
         if (token_amount == 0) { return 0 };
-        let price = get_min_price(vault, token);
-        let decimals = *vec_map::get(&vault.token_decimals, &token);
+        let price = get_min_price(vault, pool);
+        let decimals = pool.token_decimals;
 
         token_amount * price / math::pow(10 , decimals)
     }
 
-    fun get_min_price(vault: &mut Vault, token: address): u64 {
+    fun get_min_price<T>(vault: &Vault, pool: &Pool<T>): u64 {
         //todo: get price from oracle
         1
     }
 
-    fun get_max_price(vault: &mut Vault, token: address): u64 {
+    fun get_max_price<T>(vault: &Vault, pool: &Pool<T>): u64 {
         //todo: get price from oracle
         1
     }
 
-    fun get_buy_tusd_fee_basis_points(vault: &Vault, token: address, tusd_amount: u64): u64 {
-		get_fee_basis_points(vault, token, tusd_amount, vault.mint_burn_fee_basis_points, vault.tax_basis_points, true)
+    fun get_buy_tusd_fee_basis_points<T>(vault: &Vault, pool: &Pool<T>, tusd_amount: u64): u64 {
+		get_fee_basis_points(vault, pool, tusd_amount, vault.mint_burn_fee_basis_points, vault.tax_basis_points, true)
     }
 
-	fun get_sell_tusd_fee_basis_points(vault: &Vault, token: address, tusd_amount: u64): u64 {
-		get_fee_basis_points(vault, token, tusd_amount, vault.mint_burn_fee_basis_points, vault.tax_basis_points, false)
+	fun get_sell_tusd_fee_basis_points<T>(vault: &Vault, pool: &Pool<T>, tusd_amount: u64): u64 {
+		get_fee_basis_points(vault, pool, tusd_amount, vault.mint_burn_fee_basis_points, vault.tax_basis_points, false)
     }
 
-	fun get_swap_fee_basis_points(vault: &mut Vault, token_in: address, token_out: address, tusd_amount: u64): u64 {
-		let is_token_in_stable = *vec_map::get(&vault.stable_tokens, &token_in);
-		let is_token_out_stable = *vec_map::get(&vault.stable_tokens, &token_in);
-        let is_stable_swap = is_token_in_stable && is_token_out_stable;
-        let base_bps = if (is_stable_swap) vault.stable_swap_fee_basis_points else vault.swap_fee_basis_points;
-        let tax_bps = if (is_stable_swap) vault.stable_tax_basis_points else vault.tax_basis_points;
-        let fee_basis_points_0 = get_fee_basis_points(vault, token_in, tusd_amount, base_bps, tax_bps, true);
-        let fees_basis_points_1 = get_fee_basis_points(vault, token_out, tusd_amount, base_bps, tax_bps, false);
-        let point = if (fee_basis_points_0 > fees_basis_points_1) fee_basis_points_0 else fees_basis_points_1;
-		point
-    }
+	// fun get_swap_fee_basis_points(vault: &mut Vault, token_in: address, token_out: address, tusd_amount: u64): u64 {
+	// 	let is_token_in_stable = *vec_map::get(&vault.stable_tokens, &token_in);
+	// 	let is_token_out_stable = *vec_map::get(&vault.stable_tokens, &token_in);
+    //     let is_stable_swap = is_token_in_stable && is_token_out_stable;
+    //     let base_bps = if (is_stable_swap) vault.stable_swap_fee_basis_points else vault.swap_fee_basis_points;
+    //     let tax_bps = if (is_stable_swap) vault.stable_tax_basis_points else vault.tax_basis_points;
+    //     let fee_basis_points_0 = get_fee_basis_points(vault, token_in, tusd_amount, base_bps, tax_bps, true);
+    //     let fees_basis_points_1 = get_fee_basis_points(vault, token_out, tusd_amount, base_bps, tax_bps, false);
+    //     let point = if (fee_basis_points_0 > fees_basis_points_1) fee_basis_points_0 else fees_basis_points_1;
+	// 	point
+    // }
 
-	fun get_fee_basis_points(vault: &Vault, token: address, tusd_delta: u64 ,fee_basis_points: u64, tax_basis_points: u64, increment: bool): u64 {
+	fun get_fee_basis_points<T>(vault: &Vault,  pool: &Pool<T>, tusd_delta: u64 ,fee_basis_points: u64, tax_basis_points: u64, increment: bool): u64 {
 		let has_dynamic_fees = vault.has_dynamic_fees;
         if (!has_dynamic_fees) { return fee_basis_points };
 
-        let initial_amount = *vec_map::get(&vault.tusd_amounts, &token);
+        let initial_amount = pool.tusd_amounts;
         let next_amount = initial_amount + tusd_delta;
         if (!increment) {
             next_amount = if(tusd_delta > initial_amount) 0 else initial_amount - tusd_delta;
         };
 
-        let target_amount = get_target_tusd_amount(vault, token);
+        let target_amount = get_target_tusd_amount(vault, pool);
         if (target_amount == 0) { return fee_basis_points };
 
         let initial_diff = if(initial_amount > target_amount) initial_amount - target_amount else target_amount - initial_amount;
