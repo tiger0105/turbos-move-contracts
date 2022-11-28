@@ -12,6 +12,8 @@ module turbos::vault {
     use sui::tx_context::{Self, TxContext};
     use sui::vec_map::{Self, VecMap};
     use sui::dynamic_object_field as dof;
+    use turbos::tools;
+    use std::string::{Self, String};
 
     /** errors */
     const EInsufficientTusdOutput: u64 = 0;
@@ -32,6 +34,16 @@ module turbos::vault {
     const EInvalidFundingRateFactor: u64 = 15;
     const EInvalidStableFundingRateFactor: u64 = 16;
     const EPoolNotCreated: u64 = 17;
+    const EMarkPriceHigherThanLimit: u64 = 18;
+    const EMarkPriceLowerThanLimit: u64 = 19;
+    const EMaxGlobalLongsExceeded: u64 = 20;
+    const EMaxGlobalShortsExceeded: u64 = 21;
+    const EInsufficientCollateralForFees: u64 = 22;
+    const EPositionSizeExceeded: u64 = 23;
+    const EPositionCollateralExceeded: u64 = 24;
+    const EReserveExceedsPool: u64 = 25;
+    const EMaxShortsExceeded: u64 = 26;
+    const EInvalidPositionSize: u64 = 27;
     /** errors end */
     
     /** constants */
@@ -44,6 +56,7 @@ module turbos::vault {
     const TUSD_ADDRESS: address = @0x1;
     const BASIS_POINTS_DIVISOR: u64 = 10000;
     const MAX_LIQUIDATION_FEE_USD: u64 = 100000000000; // 100 usd decimals: 9
+    const FUNDING_RATE_PRECISION: u64 = 1000000;
     /** constants end */
 
     /// Coin<TLP> is the token used to mark the liquidity pool share.
@@ -52,26 +65,21 @@ module turbos::vault {
     /// Belongs to the creator of the vault.
     struct ManagerCap has key, store { id: UID }
 
-    struct Positions has key, store {
-        id: UID,
-        position_data: VecMap<PositionId, Position>,
-        collateral: u64,
-        size: u64,
-    }
-
-    struct PositionId has store, copy, drop {
-        collateral_token: address,
-        index_token: address,
-        is_long: bool,
-    }
     struct Position has store {
         id: UID,
+        sender: address,
         size: u64,
         collateral: u64,
         average_price: u64,
         entry_funding_rate: u64,
+        reserve_amount: u64,
         realised_pnl: u64 ,
         last_increased_time: u64,
+    }
+
+    struct Positions has key, store {
+        id: UID,
+        position_data: VecMap<String, Position>,
     }
 
     struct Vault has key, store {
@@ -88,6 +96,8 @@ module turbos::vault {
 
         /// fees
         liquidation_fee_usd: u64,
+        // default: 30 | 0.3%
+        deposit_fee: u64,
         // default: 50 | 0.5%
         tax_basis_points: u64,
         // default: 20 | 0.3%
@@ -100,6 +110,9 @@ module turbos::vault {
         stable_swap_fee_basis_points: u64,
         // default: 10 | 0.1%
         margin_fee_basis_points: u64,
+        // default: 100
+        // allows for a small amount of decrease of leverage
+        increase_position_buffer_basis_points: u64,
         // default: 0
         min_profit_time: u64,
         // default: false
@@ -149,8 +162,10 @@ module turbos::vault {
         last_funding_times: u64,
         // feeReserves tracks the amount of fees per token
         fee_reserves: u64,
+        global_long_sizes: u64,
         global_short_sizes: u64,
         global_short_average_prices: u64,
+        max_global_long_sizes: u64,
         max_global_short_sizes: u64,
         last_liquidity_added_at: u64,
     }
@@ -194,13 +209,55 @@ module turbos::vault {
         amount: u64,
     }
 
+    struct DecreasePoolAmountEvent has copy, drop {
+        pool: ID,
+        amount: u64,
+    }
+
+    struct CollectMarginFeesEvent has copy, drop {
+        pool: ID,
+        fee_in_usd: u64,
+        fee_token_amount: u64,
+    }
+
+    struct IncreaseReservedAmountEvent has copy, drop {
+        pool: ID,
+        amount: u64,
+    }
+
+    struct DecreaseReservedAmountEvent has copy, drop {
+        pool: ID,
+        amount: u64,
+    }
+
+    struct IncreaseGuaranteedUsdEvent has copy, drop {
+        pool: ID,
+        amount: u64,
+    }
+
+    struct DecreaseGuaranteedUsdEvent has copy, drop {
+        pool: ID,
+        amount: u64,
+    }
+
+    struct IncreasePositionEvent has copy, drop {
+        position_key: String,
+        collateral_pool_id: ID,
+        index_pool_id: ID,
+        collateral_delta_usd: u64,
+        size_delta: u64,
+        is_long: bool,
+        price: u64,
+        fee: u64,
+    }
+
     //fun init(_: &mut TxContext) {}
 
     fun init(ctx: &mut TxContext) {
         transfer::transfer(ManagerCap { id: object::new(ctx) }, tx_context::sender(ctx));
 
         let tlp_supply = balance::create_supply(TLP {});
-        let vault = Vault {
+        transfer::share_object(Vault {
             id: object::new(ctx),
             tlp_supply,
             tusd_supply_amount: 0,
@@ -210,20 +267,27 @@ module turbos::vault {
             white_listed_token_count: 0,
             max_leverage: 50, 
             liquidation_fee_usd: 2, //todo 2usd
+            deposit_fee: 30,
             tax_basis_points: 50,
             stable_tax_basis_points: 30,
             mint_burn_fee_basis_points: 30,
             swap_fee_basis_points: 30,
             stable_swap_fee_basis_points: 4,
             margin_fee_basis_points: 10,
+            increase_position_buffer_basis_points: 100,
             min_profit_time: 0,
             has_dynamic_fees: false,
             funding_interval: 28800,
             funding_rate_factor: 100,
             stable_funding_rate_factor: 100,
             total_token_weights: 0,
-        };
-        transfer::share_object(vault);
+        });
+
+        transfer::share_object(Positions {
+           id: object::new(ctx), 
+           position_data: vec_map::empty(),
+        });
+
     }
 
     entry fun create_pool<T> (
@@ -255,8 +319,10 @@ module turbos::vault {
             cumulative_funding_rates: 0,
             last_funding_times: 0,
             fee_reserves: 0,
+            global_long_sizes: 0,
             global_short_sizes: 0,
             global_short_average_prices: 0,
+            max_global_long_sizes: 0,
             max_global_short_sizes: 0,
             last_liquidity_added_at: 0,
         };
@@ -303,6 +369,291 @@ module turbos::vault {
             balance,
             tx_context::sender(ctx)
         );
+    }
+
+    entry fun increase_position<T, P>(
+        vault: &mut Vault, 
+        collateral_pool: &mut Pool<T>, 
+        index_pool: &mut Pool<P>, 
+        positions: &mut Positions,
+        token: Coin<T>, 
+        min_out: u64,
+        size_delta: u64,
+        is_long: bool,
+        price: u64,
+        ctx: &mut TxContext
+    ) {
+        let token_balance = coin::into_balance(token);
+        let token_amount = balance::value(&token_balance);
+        assert!(token_amount > 0, EInvalidAmountIn);
+
+        let mark_price = if(is_long) get_max_price(vault, index_pool) else get_min_price(vault, index_pool);
+        if (is_long) {
+            assert!(mark_price <= price, EMarkPriceHigherThanLimit);
+        } else {
+            assert!(mark_price >= price, EMarkPriceLowerThanLimit);
+        };
+
+        let sender_address = tx_context::sender(ctx);
+        let vault_address = object::id_address(vault);
+        let pool_address = object::id_address(collateral_pool);
+        let position_key = tools::get_position_key(sender_address, vault_address, pool_address, is_long);
+        if (!vec_map::contains(&positions.position_data, &position_key)) {
+            // create position
+            vec_map::insert(&mut positions.position_data, position_key, Position {
+                id: object::new(ctx),
+                sender: sender_address,
+                size: size_delta,
+                collateral: 0,
+                average_price: mark_price,
+                entry_funding_rate: 0,
+                reserve_amount: 0,
+                realised_pnl: 0 ,
+                last_increased_time: 0,
+            });
+        };
+        let position_imut = vec_map::get(&positions.position_data, &position_key);
+        let (after_fee_amount, fee_amount) = collect_fees<T>(vault, collateral_pool, position_imut ,token_amount, is_long, size_delta);
+        if(fee_amount > 0) {
+            let fee_balance = balance::split(&mut token_balance, fee_amount);
+            //todo 30% to DAO
+            balance::join(&mut collateral_pool.token, fee_balance);
+        };
+        balance::join(&mut collateral_pool.token, token_balance);
+
+        //validate global size
+        if (size_delta>0) {
+            if (is_long) {
+                let max_global_long_sizes = collateral_pool.max_global_long_sizes;
+                if (max_global_long_sizes > 0) {
+                    assert!((collateral_pool.global_long_sizes + size_delta) <= max_global_long_sizes, EMaxGlobalLongsExceeded);
+                }
+            } else {
+                let max_global_short_sizes = collateral_pool.max_global_short_sizes;
+                if (max_global_short_sizes > 0) {
+                    assert!((collateral_pool.global_short_sizes + size_delta) <= max_global_short_sizes, EMaxGlobalShortsExceeded);
+                }
+            };
+        };
+
+        // todo short tracker
+        // todo token validate
+        update_cumulative_funding_rate(vault, collateral_pool, ctx);
+
+        let position = vec_map::get_mut(&mut positions.position_data, &position_key);
+        if (size_delta > 0) {
+            position.average_price = get_next_average_price(
+                mark_price,
+                position.size,
+                size_delta,
+                position.average_price,
+                is_long,
+                0,//todo
+                index_pool.min_profit_basis_points,
+                vault.min_profit_time
+            );
+        };
+        let fee = collect_margin_fees(vault, collateral_pool, index_pool, position, size_delta);
+        let collateral_delta = after_fee_amount;
+        let collateral_delta_usd = token_to_usd_min(vault, collateral_pool, collateral_delta);
+        
+        position.collateral = position.collateral + collateral_delta_usd;
+        assert!(position.collateral>0, EInsufficientCollateralForFees);
+
+        position.collateral = position.collateral - fee;
+        position.entry_funding_rate = collateral_pool.cumulative_funding_rates;
+        position.size = position.size + size_delta;
+        position.last_increased_time = 0; //todo 
+        assert!(position.size>0, EInvalidPositionSize);
+
+        validate_position(position.size, position.collateral);
+        // todo validate_liquidation
+
+        // reserve tokens to pay profits on the position
+        let reserve_delta = usd_to_token_max(vault, collateral_pool, size_delta);
+        position.reserve_amount = position.reserve_amount + reserve_delta;
+        collateral_pool.reserved_amounts = collateral_pool.reserved_amounts + reserve_delta; 
+        assert!(collateral_pool.reserved_amounts <= collateral_pool.pool_amounts, EReserveExceedsPool);
+        event::emit(IncreaseReservedAmountEvent { pool: object::id(collateral_pool), amount: reserve_delta});
+
+        if (is_long) {
+            increase_guaranteed_usd(collateral_pool, size_delta + fee);
+            decrease_guaranteed_usd(collateral_pool, collateral_delta_usd);
+
+            increase_pool_amount(collateral_pool, collateral_delta);
+            let fee_tokens = usd_to_token_min(vault, collateral_pool, fee);
+            decrease_pool_amount(collateral_pool, fee_tokens);
+        } else {
+            if (index_pool.global_short_sizes == 0) {
+                index_pool.global_short_average_prices = mark_price;
+            } else {
+                index_pool.global_short_average_prices = get_next_global_short_average_price(index_pool, mark_price, size_delta);
+
+            };
+            increase_global_short_size(vault, index_pool, size_delta);
+        };
+
+        event::emit(IncreasePositionEvent { 
+            position_key: position_key,
+            collateral_pool_id: object::id(collateral_pool),
+            index_pool_id: object::id(index_pool),
+            collateral_delta_usd: collateral_delta_usd,
+            size_delta: size_delta,
+            is_long: is_long,
+            price: mark_price,
+            fee: fee,
+        });
+    }
+
+    // for longs: nextAveragePrice = (nextPrice * nextSize)/ (nextSize + delta)
+    // for shorts: nextAveragePrice = (nextPrice * nextSize) / (nextSize - delta)
+    fun get_next_global_short_average_price<P>(index_pool: &mut Pool<P>, next_price: u64, size_delta: u64): u64 {
+        let size = index_pool.global_short_sizes;
+        let average_price = index_pool.global_short_average_prices;
+        let price_delta = if(average_price > next_price) average_price - next_price else next_price - average_price;
+        let delta = size * price_delta / average_price;
+        let has_profit = average_price > next_price;
+
+        let next_size = size + size_delta;
+        let divisor = if(has_profit) next_size - delta else next_size + delta;
+
+        next_price * next_size / divisor
+    }
+
+    fun get_next_average_price(
+        price: u64, 
+        position_size: u64, 
+        size_delta: u64,
+        average_price: u64, 
+        is_long: bool, 
+        last_increased_time: u64,
+        min_profit_basis_points: u64,
+        min_profit_time: u64,
+    ): u64 {
+        let (has_profit, delta) = get_delta(price, position_size, average_price, is_long, last_increased_time, min_profit_basis_points, min_profit_time);
+        let next_size = position_size + size_delta;
+        let divisor;
+        if (is_long) {
+            divisor = if(has_profit) next_size + delta else next_size - delta;
+        } else {
+            divisor = if(has_profit) next_size - delta else next_size + delta;
+        };
+
+        price * next_size / divisor
+    }
+
+    fun get_delta(
+        price: u64, 
+        position_size: u64, 
+        average_price: u64, 
+        is_long: bool, 
+        last_increased_time: u64,
+        min_profit_basis_points: u64,
+        min_profit_time: u64,
+    ): (bool, u64) {
+        //_validate(_averagePrice > 0, 38);
+        let price_delta = if(average_price > price) average_price - price else price - average_price;
+        let delta = position_size * price_delta / average_price;
+
+        let has_profit;
+
+        if (is_long) {
+            has_profit = price > average_price;
+        } else {
+            has_profit = average_price > price;
+        };
+
+        // if the minProfitTime has passed then there will be no min profit threshold
+        // the min profit threshold helps to prevent front-running issues
+        let min_bps = if (1 > last_increased_time + min_profit_time) 0 else min_profit_basis_points; //todo 
+        if (has_profit && delta * BASIS_POINTS_DIVISOR <= position_size * min_bps) {
+            delta = 0;
+        };
+
+        (has_profit, delta)
+    }
+
+    fun collect_margin_fees<T, P>(
+        vault: &Vault,
+        collateral_pool: &mut Pool<T>,
+        index_pool: &Pool<P>,
+        position: &Position,
+        size_delta: u64,
+    ): u64 {
+        let fee_usd = get_position_fee(vault, size_delta);
+
+        let funding_fee = get_funding_fee(collateral_pool, position);
+        fee_usd = fee_usd + funding_fee;
+
+        let fee_tokens = usd_to_token_min<T>(vault, collateral_pool, fee_usd);
+        collateral_pool.fee_reserves = collateral_pool.fee_reserves + fee_tokens;
+
+        event::emit(CollectSwapFeesEvent { pool: object::id(collateral_pool), fee_in_usd:fee_usd, fee_token_amount:fee_tokens });
+
+        fee_usd
+    }
+
+    fun get_position_fee(vault: &Vault, size_delta: u64): u64 {
+        if (size_delta == 0) { return 0 };
+        let after_fee_usd = size_delta * (BASIS_POINTS_DIVISOR / vault.margin_fee_basis_points) / BASIS_POINTS_DIVISOR;
+
+        size_delta - after_fee_usd
+    }
+
+    fun get_funding_fee<T>(collateral_pool: &Pool<T>, position: &Position): u64 {
+        if (position.size == 0) { return 0 };
+
+        let funding_rate = collateral_pool.cumulative_funding_rates / position.entry_funding_rate;
+        if (funding_rate == 0) { return 0 };
+
+        position.size * funding_rate / FUNDING_RATE_PRECISION
+    }
+
+    fun validate_position(size: u64, collateral: u64) {
+        if (size == 0) {
+            assert!(collateral == 0, EPositionSizeExceeded);
+            return
+        };
+        assert!(size >= collateral, EPositionCollateralExceeded);
+    }
+
+    fun increase_reserved_amount<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.reserved_amounts = pool.reserved_amounts + amount; 
+        assert!(pool.reserved_amounts<=pool.pool_amounts, EReserveExceedsPool);
+        event::emit(IncreaseReservedAmountEvent { pool: object::id(pool), amount: amount});
+    }
+
+    fun decrease_reserved_amount<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.reserved_amounts = pool.reserved_amounts - amount; 
+        event::emit(DecreaseReservedAmountEvent { pool: object::id(pool), amount: amount});
+    }
+
+    fun increase_global_short_size<T>(vault: &Vault, pool: &mut Pool<T>, amount: u64) {
+        pool.global_short_sizes = pool.global_short_sizes + amount;
+
+        let max_size = pool.max_global_short_sizes;
+        if (max_size != 0) {
+            assert!(pool.global_short_sizes<=max_size, EMaxShortsExceeded);
+        }
+    }
+
+    fun decrease_global_short_size<T>(vault: &Vault, pool: &mut Pool<T>, amount: u64) {
+        if (amount > pool.global_short_sizes) {
+          pool.global_short_sizes = 0;
+          return
+        };
+
+        pool.global_short_sizes = pool.global_short_sizes - amount
+    }
+
+    fun increase_guaranteed_usd<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.guaranteed_usd = pool.guaranteed_usd + amount;
+        event::emit(IncreaseGuaranteedUsdEvent { pool: object::id(pool), amount: amount});
+    }
+
+    fun decrease_guaranteed_usd<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.guaranteed_usd = pool.guaranteed_usd - amount;
+        event::emit(DecreaseGuaranteedUsdEvent { pool: object::id(pool), amount: amount});
     }
 
     entry fun set_fees(
@@ -530,6 +881,12 @@ module turbos::vault {
         event::emit(IncreasePoolAmountEvent { pool: object::id(pool), amount: pool.pool_amounts});
     }
 
+    fun decrease_pool_amount<T>(pool: &mut Pool<T>, amount: u64) {
+        pool.pool_amounts = pool.pool_amounts - amount;
+
+        event::emit(DecreasePoolAmountEvent { pool: object::id(pool), amount: pool.pool_amounts});
+    }
+
     fun get_target_tusd_amount<T>(vault: &Vault, pool: &Pool<T>): u64 {
         let supply = vault.tusd_supply_amount;
         if (supply == 0) { return 0 };
@@ -538,12 +895,28 @@ module turbos::vault {
         target_weight
     }
 
-    fun token_to_usd_min<T>(vault: &mut Vault, pool: &Pool<T>, token_amount: u64): u64 {
+    fun token_to_usd_min<T>(vault: &Vault, pool: &Pool<T>, token_amount: u64): u64 {
         if (token_amount == 0) { return 0 };
         let price = get_min_price(vault, pool);
         let decimals = pool.token_decimals;
 
         token_amount * price / math::pow(10 , decimals)
+    }
+
+    fun usd_to_token_min<T>(vault: &Vault, pool: &Pool<T>, usd_amount: u64): u64 {
+        if (usd_amount == 0) { return 0 };
+        let price = get_min_price(vault, pool);
+        let decimals = pool.token_decimals;
+
+        usd_amount * math::pow(10 , decimals) / price
+    }
+
+    fun usd_to_token_max<T>(vault: &Vault, pool: &Pool<T>, usd_amount: u64): u64 {
+        if (usd_amount == 0) { return 0 };
+        let price = get_max_price(vault, pool);
+        let decimals = pool.token_decimals;
+
+        usd_amount * math::pow(10 , decimals) / price
     }
 
     fun get_min_price<T>(vault: &Vault, pool: &Pool<T>): u64 {
@@ -605,4 +978,63 @@ module turbos::vault {
         fee_basis_points + tax_bps
     }
 
+    fun collect_fees<T>(
+        vault: &Vault, 
+        pool: &mut Pool<T>,
+        position: &Position,
+        amount_in: u64,
+        is_long: bool,
+        size_delta: u64
+    ): (u64, u64) {
+        let should_deduct_fee = should_deduct_fee(
+            vault,
+            pool,
+            position,
+            amount_in,
+            is_long,
+            size_delta
+        );
+
+        let fee_amount = 0;
+        if (should_deduct_fee) {
+            let after_fee_amount = amount_in * (BASIS_POINTS_DIVISOR - vault.deposit_fee) / BASIS_POINTS_DIVISOR;
+            fee_amount = amount_in - after_fee_amount;
+            pool.fee_reserves = pool.fee_reserves + fee_amount;
+            return (after_fee_amount, fee_amount)
+        };
+
+        (amount_in, fee_amount)
+    }
+
+    fun should_deduct_fee<T>(
+        vault: &Vault, 
+        pool: &Pool<T>,
+        position: &Position,
+        amount_in: u64,
+        is_long: bool,
+        size_delta: u64
+    ): bool {
+        // if the position is a short, do not charge a fee
+        if (!is_long) { return false };
+
+        // if the position size is not increasing, this is a collateral deposit
+        if (size_delta == 0) { return true };
+
+        let size = position.size;
+        let collateral = position.collateral;
+
+        // if there is no existing position, do not charge a fee
+        if (size == 0) { return false };
+
+        let next_size = size + size_delta;
+        let collateral_delta = token_to_usd_min(vault, pool, amount_in);
+        let next_collateral = collateral + collateral_delta;
+
+        let next_leverage = size * BASIS_POINTS_DIVISOR / collateral;
+        // allow for a maximum of a increasePositionBufferBps decrease since there might be some swap fees taken from the collateral
+        let next_leverage = next_size * (BASIS_POINTS_DIVISOR + vault.increase_position_buffer_basis_points) / next_collateral;
+
+        // deduct a fee if the leverage is decreased
+        next_leverage < next_leverage
+    }
 }
