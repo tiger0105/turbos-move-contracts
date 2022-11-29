@@ -14,6 +14,7 @@ module turbos::vault {
     use sui::dynamic_object_field as dof;
     use turbos::tools;
     use std::string::{Self, String};
+    use turbos_time_oracle::time::{Self, Timestamp};
 
     /** errors */
     const EInsufficientTusdOutput: u64 = 0;
@@ -336,6 +337,7 @@ module turbos::vault {
         token: Coin<T>, 
         min_tusd: u64, 
         min_tlp: u64, 
+        timestamp: &Timestamp,
         ctx: &mut TxContext
     ) {
         assert!(pool.is_white_listed, EPoolNotWhiteListed);
@@ -345,7 +347,7 @@ module turbos::vault {
         assert!(token_amount > 0, EInvalidAmountIn);
 
 		// buy tusd from vault
-		let tusd_amount = buy_tusd(vault, pool, token_amount, ctx);
+		let tusd_amount = buy_tusd(vault, pool, token_amount, timestamp, ctx);
 		assert!(tusd_amount > min_tusd, EInsufficientTusdOutput);
 
         // todo get aum from oracle
@@ -360,7 +362,7 @@ module turbos::vault {
         // increase glp supply
         let balance = balance::increase_supply(&mut vault.tlp_supply, mint_amount);
 
-        pool.last_liquidity_added_at = pool.last_liquidity_added_at + tx_context::epoch(ctx);
+        pool.last_liquidity_added_at = pool.last_liquidity_added_at + time::unix(timestamp);
         event::emit(AddLiquidityEvent { account: tx_context::sender(ctx), pool: object::id(pool), amount: token_amount, aum_in_tusd, tlp_supply, tusd_amount, mint_amount });
 
         let balance = coin::from_balance(balance, ctx);
@@ -381,6 +383,7 @@ module turbos::vault {
         size_delta: u64,
         is_long: bool,
         price: u64,
+        timestamp: &Timestamp,
         ctx: &mut TxContext
     ) {
         let token_balance = coin::into_balance(token);
@@ -438,7 +441,7 @@ module turbos::vault {
 
         // todo short tracker
         // todo token validate
-        update_cumulative_funding_rate(vault, collateral_pool, ctx);
+        update_cumulative_funding_rate(vault, collateral_pool, timestamp, ctx);
 
         let position = vec_map::get_mut(&mut positions.position_data, &position_key);
         if (size_delta > 0) {
@@ -788,10 +791,10 @@ module turbos::vault {
     //     (delta, average_price > price)
     // }
 
-    fun buy_tusd<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, ctx: &mut TxContext): u64 {
+    fun buy_tusd<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, timestamp:&Timestamp, ctx: &mut TxContext): u64 {
         assert!(token_amount > 0, EInvalidAmountIn);
         
-        update_cumulative_funding_rate<T>(vault, pool, ctx);
+        update_cumulative_funding_rate<T>(vault, pool, timestamp, ctx);
 
         // todo: get price from oracle
         let price = get_min_price(vault, pool);
@@ -817,33 +820,33 @@ module turbos::vault {
         mint_amount
     }
 
-    // todo: change epoch to timestamp
-    fun update_cumulative_funding_rate<T>(vault: &mut Vault, pool: &mut Pool<T>, ctx: &mut TxContext) {
+    fun update_cumulative_funding_rate<T>(vault: &mut Vault, pool: &mut Pool<T>, timestamp: &Timestamp, ctx: &mut TxContext) {
+        let current_time = time::unix(timestamp);
         let last_funding_times = pool.last_funding_times;
         let funding_interval = vault.funding_interval;
         if (last_funding_times == 0) {
-            pool.last_funding_times = tx_context::epoch(ctx) / funding_interval * funding_interval;
+            pool.last_funding_times = current_time / funding_interval * funding_interval;
         } else {
-            if (last_funding_times + funding_interval  > tx_context::epoch(ctx)) {
+            if (last_funding_times + funding_interval  > current_time) {
                 return
             };
 
-            let funding_rate = get_next_funding_rate<T>(vault, pool, ctx);
+            let funding_rate = get_next_funding_rate<T>(vault, pool, timestamp, ctx);
 
             pool.cumulative_funding_rates = pool.cumulative_funding_rates + funding_rate;
-            pool.last_funding_times = tx_context::epoch(ctx) / funding_interval * funding_interval;
+            pool.last_funding_times = current_time / funding_interval * funding_interval;
 
             event::emit(UpdateFundingRateEvent { pool: object::id(pool), cumulative_funding_rates: pool.cumulative_funding_rates });
         }
     }
 
-    fun get_next_funding_rate<T>(vault: &Vault, pool: &Pool<T>, ctx: &mut TxContext): u64 {
+    fun get_next_funding_rate<T>(vault: &Vault, pool: &Pool<T>, timestamp: &Timestamp, ctx: &mut TxContext): u64 {
         let last_funding_times = pool.last_funding_times;
         let funding_interval = vault.funding_interval;
-        let timestamp = tx_context::epoch(ctx);
-        if (last_funding_times + funding_interval > timestamp) { return 0 };
+        let current_time = time::unix(timestamp);
+        if (last_funding_times + funding_interval > current_time) { return 0 };
 
-        let intervals = (timestamp - last_funding_times) / funding_interval;
+        let intervals = (current_time - last_funding_times) / funding_interval;
         let pool_amounts = pool.pool_amounts;
         if (pool_amounts == 0) { return 0 };
 

@@ -8,4 +8,3 @@ Sui = { local = "/Users/lmc/seerX/code/sui/crates/sui-framework" }
 
 [addresses]
 turbos_time_oracle = "0x0"
-sui = "0x2"
