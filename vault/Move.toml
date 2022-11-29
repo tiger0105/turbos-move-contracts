@@ -6,6 +6,8 @@ version = "0.0.1"
 # Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework", rev = "devnet" }
 Sui = { local = "../../sui/crates/sui-framework" }
 TurbosTimeOracle = { local = "../time-oracle" }
+TurbosAUMOracle = { local = "../aum-oracle" }
+TurbosPriceOracle = { local = "../price-oracle" }
 
 [addresses]
 turbos = "0x0"

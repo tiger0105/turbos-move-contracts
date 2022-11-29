@@ -15,6 +15,7 @@ module turbos::vault {
     use turbos::tools;
     use std::string::{Self, String};
     use turbos_time_oracle::time::{Self, Timestamp};
+    use turbos_aum_oracle::aum::{Self, AUM};
 
     /** errors */
     const EInsufficientTusdOutput: u64 = 0;
@@ -337,6 +338,7 @@ module turbos::vault {
         token: Coin<T>, 
         min_tusd: u64, 
         min_tlp: u64, 
+        aum_obj: &AUM,
         timestamp: &Timestamp,
         ctx: &mut TxContext
     ) {
@@ -350,8 +352,7 @@ module turbos::vault {
 		let tusd_amount = buy_tusd(vault, pool, token_amount, timestamp, ctx);
 		assert!(tusd_amount > min_tusd, EInsufficientTusdOutput);
 
-        // todo get aum from oracle
-        let aum_in_tusd = 0;
+        let aum_in_tusd = aum::amount(aum_obj);
         let tlp_supply = balance::supply_value(&vault.tlp_supply);
 
 		balance::join(&mut pool.token, token_balance);
