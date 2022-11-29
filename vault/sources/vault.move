@@ -16,6 +16,7 @@ module turbos::vault {
     use std::string::{Self, String};
     use turbos_time_oracle::time::{Self, Timestamp};
     use turbos_aum_oracle::aum::{Self, AUM};
+    use turbos_price_oracle::price::{Self, PriceFeed};
 
     /** errors */
     const EInsufficientTusdOutput: u64 = 0;
@@ -336,6 +337,7 @@ module turbos::vault {
         vault: &mut Vault, 
         pool: &mut Pool<T>, 
         token: Coin<T>, 
+        token_price_feed: &PriceFeed,
         min_tusd: u64, 
         min_tlp: u64, 
         aum_obj: &AUM,
@@ -349,7 +351,7 @@ module turbos::vault {
         assert!(token_amount > 0, EInvalidAmountIn);
 
 		// buy tusd from vault
-		let tusd_amount = buy_tusd(vault, pool, token_amount, timestamp, ctx);
+		let tusd_amount = buy_tusd(vault, pool, token_amount, timestamp, token_price_feed, ctx);
 		assert!(tusd_amount > min_tusd, EInsufficientTusdOutput);
 
         let aum_in_tusd = aum::amount(aum_obj);
@@ -378,6 +380,8 @@ module turbos::vault {
         vault: &mut Vault, 
         collateral_pool: &mut Pool<T>, 
         index_pool: &mut Pool<P>, 
+        index_price_feed: &PriceFeed, 
+        collateral_price_feed: &PriceFeed, 
         positions: &mut Positions,
         token: Coin<T>, 
         min_out: u64,
@@ -391,7 +395,7 @@ module turbos::vault {
         let token_amount = balance::value(&token_balance);
         assert!(token_amount > 0, EInvalidAmountIn);
 
-        let mark_price = if(is_long) get_max_price(vault, index_pool) else get_min_price(vault, index_pool);
+        let mark_price = if(is_long) get_max_price(vault, index_pool, index_price_feed) else get_min_price(vault, index_pool, index_price_feed);
         if (is_long) {
             assert!(mark_price <= price, EMarkPriceHigherThanLimit);
         } else {
@@ -417,7 +421,7 @@ module turbos::vault {
             });
         };
         let position_imut = vec_map::get(&positions.position_data, &position_key);
-        let (after_fee_amount, fee_amount) = collect_fees<T>(vault, collateral_pool, position_imut ,token_amount, is_long, size_delta);
+        let (after_fee_amount, fee_amount) = collect_fees<T>(vault, collateral_pool, position_imut ,token_amount, is_long, size_delta, collateral_price_feed);
         if(fee_amount > 0) {
             let fee_balance = balance::split(&mut token_balance, fee_amount);
             //todo 30% to DAO
@@ -452,14 +456,15 @@ module turbos::vault {
                 size_delta,
                 position.average_price,
                 is_long,
-                0,//todo
+                position.last_increased_time,
                 index_pool.min_profit_basis_points,
-                vault.min_profit_time
+                vault.min_profit_time,
+                timestamp,
             );
         };
-        let fee = collect_margin_fees(vault, collateral_pool, index_pool, position, size_delta);
+        let fee = collect_margin_fees(vault, collateral_pool, index_pool, position, size_delta, collateral_price_feed);
         let collateral_delta = after_fee_amount;
-        let collateral_delta_usd = token_to_usd_min(vault, collateral_pool, collateral_delta);
+        let collateral_delta_usd = token_to_usd_min(vault, collateral_pool, collateral_delta, collateral_price_feed);
         
         position.collateral = position.collateral + collateral_delta_usd;
         assert!(position.collateral>0, EInsufficientCollateralForFees);
@@ -467,14 +472,14 @@ module turbos::vault {
         position.collateral = position.collateral - fee;
         position.entry_funding_rate = collateral_pool.cumulative_funding_rates;
         position.size = position.size + size_delta;
-        position.last_increased_time = 0; //todo 
+        position.last_increased_time = time::unix(timestamp);
         assert!(position.size>0, EInvalidPositionSize);
 
         validate_position(position.size, position.collateral);
         // todo validate_liquidation
 
         // reserve tokens to pay profits on the position
-        let reserve_delta = usd_to_token_max(vault, collateral_pool, size_delta);
+        let reserve_delta = usd_to_token_max(vault, collateral_pool, size_delta, collateral_price_feed);
         position.reserve_amount = position.reserve_amount + reserve_delta;
         collateral_pool.reserved_amounts = collateral_pool.reserved_amounts + reserve_delta; 
         assert!(collateral_pool.reserved_amounts <= collateral_pool.pool_amounts, EReserveExceedsPool);
@@ -485,7 +490,7 @@ module turbos::vault {
             decrease_guaranteed_usd(collateral_pool, collateral_delta_usd);
 
             increase_pool_amount(collateral_pool, collateral_delta);
-            let fee_tokens = usd_to_token_min(vault, collateral_pool, fee);
+            let fee_tokens = usd_to_token_min(vault, collateral_pool, fee, collateral_price_feed);
             decrease_pool_amount(collateral_pool, fee_tokens);
         } else {
             if (index_pool.global_short_sizes == 0) {
@@ -533,8 +538,9 @@ module turbos::vault {
         last_increased_time: u64,
         min_profit_basis_points: u64,
         min_profit_time: u64,
+        timestamp: &Timestamp,
     ): u64 {
-        let (has_profit, delta) = get_delta(price, position_size, average_price, is_long, last_increased_time, min_profit_basis_points, min_profit_time);
+        let (has_profit, delta) = get_delta(price, position_size, average_price, is_long, last_increased_time, min_profit_basis_points, min_profit_time, timestamp);
         let next_size = position_size + size_delta;
         let divisor;
         if (is_long) {
@@ -554,6 +560,7 @@ module turbos::vault {
         last_increased_time: u64,
         min_profit_basis_points: u64,
         min_profit_time: u64,
+        timestamp: &Timestamp,
     ): (bool, u64) {
         //_validate(_averagePrice > 0, 38);
         let price_delta = if(average_price > price) average_price - price else price - average_price;
@@ -569,7 +576,7 @@ module turbos::vault {
 
         // if the minProfitTime has passed then there will be no min profit threshold
         // the min profit threshold helps to prevent front-running issues
-        let min_bps = if (1 > last_increased_time + min_profit_time) 0 else min_profit_basis_points; //todo 
+        let min_bps = if (time::unix(timestamp) > last_increased_time + min_profit_time) 0 else min_profit_basis_points;
         if (has_profit && delta * BASIS_POINTS_DIVISOR <= position_size * min_bps) {
             delta = 0;
         };
@@ -583,13 +590,14 @@ module turbos::vault {
         index_pool: &Pool<P>,
         position: &Position,
         size_delta: u64,
+        price_feed: &PriceFeed
     ): u64 {
         let fee_usd = get_position_fee(vault, size_delta);
 
         let funding_fee = get_funding_fee(collateral_pool, position);
         fee_usd = fee_usd + funding_fee;
 
-        let fee_tokens = usd_to_token_min<T>(vault, collateral_pool, fee_usd);
+        let fee_tokens = usd_to_token_min<T>(vault, collateral_pool, fee_usd, price_feed);
         collateral_pool.fee_reserves = collateral_pool.fee_reserves + fee_tokens;
 
         event::emit(CollectSwapFeesEvent { pool: object::id(collateral_pool), fee_in_usd:fee_usd, fee_token_amount:fee_tokens });
@@ -792,13 +800,13 @@ module turbos::vault {
     //     (delta, average_price > price)
     // }
 
-    fun buy_tusd<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, timestamp:&Timestamp, ctx: &mut TxContext): u64 {
+    fun buy_tusd<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, timestamp:&Timestamp, price_feed: &PriceFeed, ctx: &mut TxContext): u64 {
         assert!(token_amount > 0, EInvalidAmountIn);
         
         update_cumulative_funding_rate<T>(vault, pool, timestamp, ctx);
 
         // todo: get price from oracle
-        let price = get_min_price(vault, pool);
+        let price = get_min_price(vault, pool, price_feed);
         let token_decimals = pool.token_decimals;
 
         let tusd_amount = token_amount * price / PRICE_PRECISION;
@@ -807,7 +815,7 @@ module turbos::vault {
 
         //todo
         let fee_basis_points = get_buy_tusd_fee_basis_points(vault, pool, tusd_amount);
-        let amount_after_fees = collect_swap_fees(vault, pool, token_amount, fee_basis_points);
+        let amount_after_fees = collect_swap_fees(vault, pool, token_amount, fee_basis_points, price_feed);
         let mint_amount = amount_after_fees * price / PRICE_PRECISION;
         mint_amount = adjust_for_decimals(mint_amount, token_decimals, TUSD_DECIMALS);
 
@@ -858,11 +866,11 @@ module turbos::vault {
         next_funding_rate
     }
 
-    fun collect_swap_fees<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, fee_basis_points: u64): u64 {
+    fun collect_swap_fees<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, fee_basis_points: u64, price_feed: &PriceFeed): u64 {
         let after_fee_amount = token_amount * (BASIS_POINTS_DIVISOR - fee_basis_points) / BASIS_POINTS_DIVISOR;
         let fee_amount = token_amount - after_fee_amount;
         pool.fee_reserves = pool.fee_reserves + fee_amount;
-        event::emit(CollectSwapFeesEvent { pool: object::id(pool), fee_in_usd:token_to_usd_min(vault, pool, fee_amount), fee_token_amount:fee_amount });
+        event::emit(CollectSwapFeesEvent { pool: object::id(pool), fee_in_usd:token_to_usd_min(vault, pool, fee_amount, price_feed), fee_token_amount:fee_amount });
 
         after_fee_amount
     }
@@ -899,38 +907,38 @@ module turbos::vault {
         target_weight
     }
 
-    fun token_to_usd_min<T>(vault: &Vault, pool: &Pool<T>, token_amount: u64): u64 {
+    fun token_to_usd_min<T>(vault: &Vault, pool: &Pool<T>, token_amount: u64, price_feed: &PriceFeed): u64 {
         if (token_amount == 0) { return 0 };
-        let price = get_min_price(vault, pool);
+        let price = get_min_price(vault, pool, price_feed);
         let decimals = pool.token_decimals;
 
         token_amount * price / math::pow(10 , decimals)
     }
 
-    fun usd_to_token_min<T>(vault: &Vault, pool: &Pool<T>, usd_amount: u64): u64 {
+    fun usd_to_token_min<T>(vault: &Vault, pool: &Pool<T>, usd_amount: u64, price_feed: &PriceFeed): u64 {
         if (usd_amount == 0) { return 0 };
-        let price = get_min_price(vault, pool);
+        let price = get_min_price(vault, pool, price_feed);
         let decimals = pool.token_decimals;
 
         usd_amount * math::pow(10 , decimals) / price
     }
 
-    fun usd_to_token_max<T>(vault: &Vault, pool: &Pool<T>, usd_amount: u64): u64 {
+    fun usd_to_token_max<T>(vault: &Vault, pool: &Pool<T>, usd_amount: u64, price_feed: &PriceFeed): u64 {
         if (usd_amount == 0) { return 0 };
-        let price = get_max_price(vault, pool);
+        let price = get_max_price(vault, pool, price_feed);
         let decimals = pool.token_decimals;
 
         usd_amount * math::pow(10 , decimals) / price
     }
 
-    fun get_min_price<T>(vault: &Vault, pool: &Pool<T>): u64 {
-        //todo: get price from oracle
-        1
+    fun get_min_price<T>(vault: &Vault, pool: &Pool<T>, price_feed: &PriceFeed): u64 {
+        //todo: spread_basis_points
+        price::price(price_feed)
     }
 
-    fun get_max_price<T>(vault: &Vault, pool: &Pool<T>): u64 {
-        //todo: get price from oracle
-        1
+    fun get_max_price<T>(vault: &Vault, pool: &Pool<T>, price_feed: &PriceFeed): u64 {
+        //todo: spread_basis_points
+        price::price(price_feed)
     }
 
     fun get_buy_tusd_fee_basis_points<T>(vault: &Vault, pool: &Pool<T>, tusd_amount: u64): u64 {
@@ -988,7 +996,8 @@ module turbos::vault {
         position: &Position,
         amount_in: u64,
         is_long: bool,
-        size_delta: u64
+        size_delta: u64,
+        price_feed: &PriceFeed,
     ): (u64, u64) {
         let should_deduct_fee = should_deduct_fee(
             vault,
@@ -996,7 +1005,8 @@ module turbos::vault {
             position,
             amount_in,
             is_long,
-            size_delta
+            size_delta,
+            price_feed,
         );
 
         let fee_amount = 0;
@@ -1016,7 +1026,8 @@ module turbos::vault {
         position: &Position,
         amount_in: u64,
         is_long: bool,
-        size_delta: u64
+        size_delta: u64,
+        price_feed: &PriceFeed,
     ): bool {
         // if the position is a short, do not charge a fee
         if (!is_long) { return false };
@@ -1031,7 +1042,7 @@ module turbos::vault {
         if (size == 0) { return false };
 
         let next_size = size + size_delta;
-        let collateral_delta = token_to_usd_min(vault, pool, amount_in);
+        let collateral_delta = token_to_usd_min(vault, pool, amount_in, price_feed);
         let next_collateral = collateral + collateral_delta;
 
         let next_leverage = size * BASIS_POINTS_DIVISOR / collateral;
