@@ -49,6 +49,6 @@ module turbos_aum_oracle::aum {
         ctx: &mut TxContext,
     ) {
         aum.amount = amount;
-        aum.last_update_time = aum.last_update_time;
+        aum.last_update_time = unix_now;
     }
 }
