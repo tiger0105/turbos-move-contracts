@@ -47,6 +47,13 @@ module turbos::vault {
     const EReserveExceedsPool: u64 = 25;
     const EMaxShortsExceeded: u64 = 26;
     const EInvalidPositionSize: u64 = 27;
+    const EInvalidTLPAmountIn: u64 = 28;
+    const EInvalidTusdRedemAmount: u64 = 29;
+    const EMaxTUSDExceeded: u64 = 30;
+    const EInsufficientOutput: u64 = 30;
+    const EPositionNotFound: u64 = 30;
+    const EEmptyPosition: u64 = 31;
+    const ECooldownDurationNotYetPassed: u64 = 32;
     /** errors end */
     
     /** constants */
@@ -68,8 +75,7 @@ module turbos::vault {
     /// Belongs to the creator of the vault.
     struct ManagerCap has key, store { id: UID }
 
-    struct Position has store {
-        id: UID,
+    struct Position has store, drop {
         sender: address,
         size: u64,
         collateral: u64,
@@ -173,6 +179,14 @@ module turbos::vault {
         last_liquidity_added_at: u64,
     }
 
+    struct SellTUSDEvent has copy, drop {
+        receiver: address,
+        pool: ID,
+        amount_out: u64,
+        tusd_amount: u64,
+        fee_basis_points: u64,
+    }
+
     struct BuyTUSDEvent has copy, drop {
         receiver: address,
         pool: ID,
@@ -202,7 +216,22 @@ module turbos::vault {
         mint_amount: u64,
     }
 
+    struct RemoveLiquidityEvent has copy, drop {
+        account: address, 
+        pool: ID,
+        tlp_amount: u64,
+        aum_in_tusd: u64, 
+        tlp_supply: u64,
+        tusd_amount: u64, 
+        amount_out: u64,
+    }
+
     struct IncreaseTusdAmountEvent has copy, drop {
+        pool: ID,
+        amount: u64,
+    }
+
+    struct DecreaseTusdAmountEvent has copy, drop {
         pool: ID,
         amount: u64,
     }
@@ -252,6 +281,24 @@ module turbos::vault {
         is_long: bool,
         price: u64,
         fee: u64,
+    }
+
+    struct DecreasePositionEvent has copy, drop {
+        position_key: String,
+        collateral_pool_id: ID,
+        index_pool_id: ID,
+        collateral_delta_usd: u64,
+        size_delta: u64,
+        is_long: bool,
+        price: u64,
+        fee: u64,
+    }
+
+
+    struct UpdatePnlEvent has copy, drop {
+        position_key: String,
+        has_profit: bool,
+        adjusted_delta: u64,
     }
 
     //fun init(_: &mut TxContext) {}
@@ -363,17 +410,70 @@ module turbos::vault {
 		assert!(mint_amount > min_tlp, EInsufficientTlpOutput);
 
         // increase glp supply
-        let balance = balance::increase_supply(&mut vault.tlp_supply, mint_amount);
-
-        pool.last_liquidity_added_at = pool.last_liquidity_added_at + time::unix(timestamp);
-        event::emit(AddLiquidityEvent { account: tx_context::sender(ctx), pool: object::id(pool), amount: token_amount, aum_in_tusd, tlp_supply, tusd_amount, mint_amount });
-
-        let balance = coin::from_balance(balance, ctx);
-
+        let glp_balance = balance::increase_supply(&mut vault.tlp_supply, mint_amount);
+        let glp_coin = coin::from_balance(glp_balance, ctx);
         transfer::transfer(
-            balance,
+            glp_coin,
             tx_context::sender(ctx)
         );
+        pool.last_liquidity_added_at = pool.last_liquidity_added_at + time::unix(timestamp);
+
+        event::emit(AddLiquidityEvent { 
+            account: tx_context::sender(ctx), 
+            pool: object::id(pool), 
+            amount: token_amount, 
+            aum_in_tusd, 
+            tlp_supply, 
+            tusd_amount, 
+            mint_amount 
+        });
+    }
+
+    entry fun remove_liquidity<T>(
+        vault: &mut Vault,
+        pool: &mut Pool<T>, 
+        tlp: Coin<TLP>, 
+        token_price_feed: &PriceFeed,
+        min_out: u64, 
+        receiver: address,
+        aum_obj: &AUM,
+        timestamp: &Timestamp,
+        ctx: &mut TxContext
+    ) {
+        assert!(pool.last_liquidity_added_at + vault.cooldown_duration <= time::unix(timestamp), ECooldownDurationNotYetPassed);
+
+        let tlp_balance = coin::into_balance(tlp);
+        let tlp_amount = balance::value(&tlp_balance);
+        assert!(tlp_amount > 0, EInvalidTLPAmountIn);
+
+        let aum_in_tusd = aum::amount(aum_obj);
+        let tlp_supply = balance::supply_value(&vault.tlp_supply);
+        let tusd_amount = tlp_amount * aum_in_tusd / tlp_supply;
+        let tusd_balance = vault.tusd_supply_amount;
+
+        // The price of tlp changes, so there may be an increase in system debt. 
+        // mint needs to increase the debt
+        if (tusd_amount > tusd_balance) {
+            vault.tusd_supply_amount = vault.tusd_supply_amount + (tusd_amount - tusd_balance);
+        };
+        balance::decrease_supply(&mut vault.tlp_supply, tlp_balance);
+        vault.tusd_supply_amount = vault.tusd_supply_amount - tusd_amount;
+
+        let amount_out = sell_tusd<T>(vault, pool, tusd_amount, timestamp, token_price_feed, ctx);
+        assert!(amount_out >= min_out, EInsufficientOutput);
+        let amount_out_balance = balance::split(&mut pool.token, amount_out);
+        let amount_out_coin = coin::from_balance(amount_out_balance, ctx);
+        transfer::transfer(amount_out_coin, receiver);
+
+        event::emit(RemoveLiquidityEvent { 
+            account: tx_context::sender(ctx), 
+            pool: object::id(pool), 
+            tlp_amount: tlp_amount, 
+            aum_in_tusd, 
+            tlp_supply,
+            tusd_amount, 
+            amount_out 
+        });
     }
 
     entry fun increase_position<T, P>(
@@ -409,7 +509,6 @@ module turbos::vault {
         if (!vec_map::contains(&positions.position_data, &position_key)) {
             // create position
             vec_map::insert(&mut positions.position_data, position_key, Position {
-                id: object::new(ctx),
                 sender: sender_address,
                 size: size_delta,
                 collateral: 0,
@@ -512,6 +611,212 @@ module turbos::vault {
             price: mark_price,
             fee: fee,
         });
+    }
+
+    entry fun decrease_position<T, P>(
+        vault: &mut Vault, 
+        collateral_pool: &mut Pool<T>, 
+        index_pool: &mut Pool<P>, 
+        index_price_feed: &PriceFeed, 
+        collateral_price_feed: &PriceFeed, 
+        positions: &mut Positions,
+        collateral_delta: u64, 
+        size_delta: u64,
+        is_long: bool,
+        receiver: address,
+        price: u64,
+        timestamp: &Timestamp,
+        ctx: &mut TxContext
+    ) {
+        let mark_price = if(is_long) get_min_price(vault, index_pool, index_price_feed) else get_max_price(vault, index_pool, index_price_feed);
+        if (is_long) {
+            assert!(mark_price >= price, EMarkPriceLowerThanLimit);
+        } else {
+            assert!(mark_price <= price, EMarkPriceHigherThanLimit);
+        };
+
+        let sender_address = tx_context::sender(ctx);
+        let vault_address = object::id_address(vault);
+        let pool_address = object::id_address(collateral_pool);
+        let position_key = tools::get_position_key(sender_address, vault_address, pool_address, is_long);
+        assert!(vec_map::contains(&positions.position_data, &position_key), EPositionNotFound);
+        
+        let position = vec_map::get_mut(&mut positions.position_data, &position_key);
+        assert!(position.size > 0, EEmptyPosition);
+        assert!(position.size > size_delta, EPositionSizeExceeded);
+        assert!(position.collateral > collateral_delta, EPositionCollateralExceeded);
+        let collateral = position.collateral;
+        
+        let reserve_delta = position.reserve_amount * size_delta / position.size;
+        position.reserve_amount = position.reserve_amount - reserve_delta;
+        decrease_reserved_amount(collateral_pool, reserve_delta);
+
+        let fee = collect_margin_fees(vault, collateral_pool, index_pool, position, size_delta, collateral_price_feed);
+
+        let (has_profit, delta) = get_delta(
+            price, 
+            position.size, 
+            position.average_price, 
+            is_long, 
+            position.last_increased_time, 
+            index_pool.min_profit_basis_points, 
+            vault.min_profit_time, 
+            timestamp
+        );
+        let adjusted_delta = size_delta * delta / position.size;
+
+        let usd_out = 0;
+        if (has_profit && adjusted_delta > 0) {
+            usd_out = adjusted_delta;
+            position.realised_pnl = position.realised_pnl + adjusted_delta;
+
+            if (!is_long) {
+                let token_amount = usd_to_token_min(vault, collateral_pool, adjusted_delta, collateral_price_feed);
+                decrease_pool_amount(collateral_pool, token_amount);
+            };
+        };
+
+        if (!has_profit && adjusted_delta > 0) {
+            position.collateral = position.collateral - adjusted_delta;
+
+            if (!is_long) {
+                let token_amount = usd_to_token_min(vault, collateral_pool, adjusted_delta, collateral_price_feed);
+                increase_pool_amount(collateral_pool, token_amount);
+            };
+            position.realised_pnl = position.realised_pnl - adjusted_delta;
+        };
+
+        if (collateral_delta > 0) {
+            usd_out = usd_out + collateral_delta;
+            position.collateral = position.collateral - collateral_delta;
+        };
+
+        if (position.size == size_delta) {
+            usd_out = usd_out + position.collateral;
+            position.collateral = 0;
+        };
+        
+        let usd_out_after_fee = usd_out;
+        if (usd_out > fee) {
+            usd_out_after_fee = usd_out - fee;
+        } else {
+            position.collateral = position.collateral - fee;
+            if (is_long) {
+                let fee_tokens = usd_to_token_min(vault, collateral_pool, fee, collateral_price_feed);
+                decrease_pool_amount(collateral_pool, fee_tokens);
+            };
+        };
+        event::emit(UpdatePnlEvent { position_key, has_profit, adjusted_delta});
+
+        if (position.size != size_delta) {
+            position.entry_funding_rate = collateral_pool.cumulative_funding_rates;
+            position.size = position.size - size_delta;
+            validate_position(position.size, position.collateral);
+            // todo validate_liquidation
+
+            if (is_long) {
+                increase_guaranteed_usd(collateral_pool, collateral - position.collateral);
+                decrease_guaranteed_usd(collateral_pool, size_delta);
+            };
+        } else {
+            if (is_long) {
+                increase_guaranteed_usd(collateral_pool, collateral);
+                decrease_guaranteed_usd(collateral_pool, size_delta);
+            };
+
+            vec_map::remove(&mut positions.position_data, &position_key);
+        };
+
+        if (!is_long) {
+            decrease_global_short_size(vault, index_pool, size_delta);
+        };
+
+        if (usd_out > 0) {
+            if (is_long) {
+                let decrease_amount = usd_to_token_min(vault, collateral_pool, usd_out, collateral_price_feed);
+                decrease_pool_amount(collateral_pool, decrease_amount)
+            };
+            let amount_out_after_fees = usd_to_token_min(vault, collateral_pool, usd_out_after_fee, collateral_price_feed);
+            let amount_out_after_fees_balance = balance::split(&mut collateral_pool.token, amount_out_after_fees);
+            let amount_out_after_fees_coin = coin::from_balance(amount_out_after_fees_balance, ctx);
+            transfer::transfer(amount_out_after_fees_coin, receiver);
+        };
+
+        event::emit(DecreasePositionEvent { 
+            position_key: position_key,
+            collateral_pool_id: object::id(collateral_pool),
+            index_pool_id: object::id(index_pool),
+            collateral_delta_usd: collateral_delta,
+            size_delta: size_delta,
+            is_long: is_long,
+            price: mark_price,
+            fee: fee,
+        });
+    }
+
+    fun buy_tusd<T>(
+        vault: &mut Vault, 
+        pool: &mut Pool<T>, 
+        token_amount: u64, 
+        timestamp:&Timestamp, 
+        price_feed: &PriceFeed, 
+        ctx: &mut TxContext
+    ): u64 {
+        assert!(token_amount > 0, EInvalidAmountIn);
+        
+        update_cumulative_funding_rate<T>(vault, pool, timestamp, ctx);
+
+        let price = get_min_price(vault, pool, price_feed);
+        let token_decimals = pool.token_decimals;
+
+        let tusd_amount = token_amount * price / PRICE_PRECISION;
+        tusd_amount = adjust_for_decimals(tusd_amount, token_decimals, TUSD_DECIMALS);
+        assert!(tusd_amount > 0, EInvalidTusdAmount);
+
+        let fee_basis_points = get_buy_tusd_fee_basis_points(vault, pool, tusd_amount);
+        let amount_after_fees = collect_swap_fees(vault, pool, token_amount, fee_basis_points, price_feed);
+        let mint_amount = amount_after_fees * price / PRICE_PRECISION;
+        mint_amount = adjust_for_decimals(mint_amount, token_decimals, TUSD_DECIMALS);
+
+        increase_tusd_amount(pool, mint_amount);
+        increase_pool_amount(pool, amount_after_fees);
+
+        vault.tusd_supply_amount = vault.tusd_supply_amount + mint_amount;
+
+        event::emit(BuyTUSDEvent { receiver: tx_context::sender(ctx), pool: object::id(pool), token_amount, mint_amount, fee_basis_points });
+
+        mint_amount
+    }
+
+    fun sell_tusd<T>(
+        vault: &mut Vault, 
+        pool: &mut Pool<T>, 
+        tusd_amount: u64, 
+        timestamp:&Timestamp, 
+        price_feed: &PriceFeed, 
+        ctx: &mut TxContext
+    ): u64 {
+        assert!(tusd_amount > 0, EInvalidAmountIn);
+        
+        update_cumulative_funding_rate<T>(vault, pool, timestamp, ctx);
+
+        let price = get_max_price(vault, pool, price_feed);
+        let token_decimals = pool.token_decimals;
+
+        let redemption_amount = tusd_amount * PRICE_PRECISION / price;
+        assert!(redemption_amount > 0, EInvalidTusdRedemAmount);
+
+        decrease_tusd_amount(pool, tusd_amount);
+        decrease_pool_amount(pool, redemption_amount);
+        vault.tusd_supply_amount = vault.tusd_supply_amount - tusd_amount;
+
+        let fee_basis_points = get_sell_tusd_fee_basis_points(vault, pool, tusd_amount);
+        let amount_out = collect_swap_fees(vault, pool, redemption_amount, fee_basis_points, price_feed);
+        assert!(amount_out > 0, EInvalidAmountOut);
+
+        event::emit(SellTUSDEvent { receiver: tx_context::sender(ctx), pool: object::id(pool), amount_out, tusd_amount, fee_basis_points });
+
+        amount_out
     }
 
     // for longs: nextAveragePrice = (nextPrice * nextSize)/ (nextSize + delta)
@@ -800,35 +1105,6 @@ module turbos::vault {
     //     (delta, average_price > price)
     // }
 
-    fun buy_tusd<T>(vault: &mut Vault, pool: &mut Pool<T>, token_amount: u64, timestamp:&Timestamp, price_feed: &PriceFeed, ctx: &mut TxContext): u64 {
-        assert!(token_amount > 0, EInvalidAmountIn);
-        
-        update_cumulative_funding_rate<T>(vault, pool, timestamp, ctx);
-
-        // todo: get price from oracle
-        let price = get_min_price(vault, pool, price_feed);
-        let token_decimals = pool.token_decimals;
-
-        let tusd_amount = token_amount * price / PRICE_PRECISION;
-        tusd_amount = adjust_for_decimals(tusd_amount, token_decimals, TUSD_DECIMALS);
-        assert!(tusd_amount > 0, EInvalidTusdAmount);
-
-        //todo
-        let fee_basis_points = get_buy_tusd_fee_basis_points(vault, pool, tusd_amount);
-        let amount_after_fees = collect_swap_fees(vault, pool, token_amount, fee_basis_points, price_feed);
-        let mint_amount = amount_after_fees * price / PRICE_PRECISION;
-        mint_amount = adjust_for_decimals(mint_amount, token_decimals, TUSD_DECIMALS);
-
-        increase_tusd_amount(pool, mint_amount);
-        increase_pool_amount(pool, amount_after_fees);
-
-        vault.tusd_supply_amount = vault.tusd_supply_amount + mint_amount;
-
-        event::emit(BuyTUSDEvent { receiver: tx_context::sender(ctx), pool: object::id(pool), token_amount, mint_amount, fee_basis_points });
-
-        mint_amount
-    }
-
     fun update_cumulative_funding_rate<T>(vault: &mut Vault, pool: &mut Pool<T>, timestamp: &Timestamp, ctx: &mut TxContext) {
         let current_time = time::unix(timestamp);
         let last_funding_times = pool.last_funding_times;
@@ -883,8 +1159,21 @@ module turbos::vault {
 
     fun increase_tusd_amount<T>(pool: &mut Pool<T>, amount: u64) {
         pool.tusd_amounts = pool.tusd_amounts + amount;
+        if (pool.max_tusd_amounts !=0) {
+            assert!(pool.tusd_amounts <= pool.max_tusd_amounts, EMaxTUSDExceeded);
+        };
 
         event::emit(IncreaseTusdAmountEvent { pool: object::id(pool), amount: pool.tusd_amounts});
+    }
+
+    fun decrease_tusd_amount<T>(pool: &mut Pool<T>, amount: u64) {
+        if (pool.tusd_amounts < amount) {
+            pool.tusd_amounts = 0;
+        } else {
+            pool.tusd_amounts = pool.tusd_amounts - amount;
+        };
+
+        event::emit(DecreaseTusdAmountEvent { pool: object::id(pool), amount: pool.tusd_amounts});
     }
 
     fun increase_pool_amount<T>(pool: &mut Pool<T>, amount: u64) {
