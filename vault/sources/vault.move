@@ -134,6 +134,7 @@ module turbos::vault {
         stable_funding_rate_factor: u64,
 
         total_token_weights: u64,
+        cooldown_duration: u64,
     }
 
     struct Pool<phantom T> has key, store {
@@ -331,6 +332,7 @@ module turbos::vault {
             funding_rate_factor: 100,
             stable_funding_rate_factor: 100,
             total_token_weights: 0,
+            cooldown_duration: 0,
         });
 
         transfer::share_object(Positions {

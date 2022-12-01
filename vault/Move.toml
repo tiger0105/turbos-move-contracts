@@ -3,12 +3,16 @@ name = "turbos"
 version = "0.0.1"
 
 [dependencies]
-# Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework", rev = "devnet" }
-Sui = { local = "../../sui/crates/sui-framework" }
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework", rev = "devnet" }
+# Sui = { local = "../../sui/crates/sui-framework" }
 TurbosTimeOracle = { local = "../time-oracle" }
 TurbosAUMOracle = { local = "../aum-oracle" }
 TurbosPriceOracle = { local = "../price-oracle" }
 
 [addresses]
 turbos = "0x0"
-sui = "0x2"
+
+[dev-addresses]
+turbos_price_oracle = "0x5daf29f3292cf7196123025a795dd303e219749d"
+turbos_time_oracle = "0xcc2e403d160652e8d1b475ef2d5bc5384beaaa61"
+turbos_aum_oracle = "0x943c0de4287edbf2ba2e01717025253ed5a81dab"

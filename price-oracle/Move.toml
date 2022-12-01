@@ -7,4 +7,7 @@ version = "0.0.1"
 Sui = { local = "../../sui/crates/sui-framework" }
 
 [addresses]
+turbos_price_oracle = "_"
+
+[dev-addresses]
 turbos_price_oracle = "0x0"
