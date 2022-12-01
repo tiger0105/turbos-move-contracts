@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 module turbos_price_oracle::price {
-    use sui::transfer::{Self, transfer, share_object};
-    use sui::object::{Self, ID, UID};
-    use std::option::{Self, Option};
+    use sui::transfer::{transfer, share_object};
+    use sui::object::{Self, UID};
     use sui::tx_context::{Self, TxContext};
-    use std::string::{Self, String};
+    use std::string::{String};
 
     struct PriceFeed has key {
         id: UID,
@@ -73,7 +72,7 @@ module turbos_price_oracle::price {
         price: u64,
         ema_price: u64, //unix timestamp
         timestamp: u64,
-        ctx: &mut TxContext,
+        _ctx: &mut TxContext,
     ) {
         price_feed.price = price;
         price_feed.ema_price = ema_price;
@@ -84,7 +83,7 @@ module turbos_price_oracle::price {
         _: &mut AuthorityCap,
         price_feed: &mut PriceFeed,
         decimal: u8,
-        ctx: &mut TxContext,
+        _ctx: &mut TxContext,
     ) {
         price_feed.decimal = decimal;
     }
@@ -93,7 +92,7 @@ module turbos_price_oracle::price {
         _: &mut AuthorityCap,
         price_feed: &mut PriceFeed,
         symbol: String,
-        ctx: &mut TxContext,
+        _ctx: &mut TxContext,
     ) {
         price_feed.symbol = symbol;
     }

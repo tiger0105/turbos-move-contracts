@@ -7,7 +7,6 @@ module turbos::tools {
     use std::bcs;
     use std::string::{Self, String};
     use sui::math;
-
     
     public fun get_position_key(sender: address, vault: address, pool: address, is_long: bool): String {
         let address_str = address_to_hexstring(&sender);
@@ -96,7 +95,7 @@ module turbos::tools {
    #[test]
     public fun test_u64_to_string() {
         assert!(
-            u64_to_string(12345) == string::utf8(b"123456"),
+            u64_to_string(123456) == string::utf8(b"123456"),
             1
         );
         assert!(
@@ -118,16 +117,21 @@ module turbos::tools {
     fun test_u64_to_hexstring() {
         assert!(u64_to_hexstring(72) == string::utf8(b"48"), 1);
         assert!(u64_to_hexstring(108) == string::utf8(b"6c"), 1);
+        assert!(u64_to_hexstring(1) == string::utf8(b"01"), 1);
+        assert!(u64_to_hexstring(0) == string::utf8(b"00"), 1);
     }
 
-    // #[test]
-    // fun test_hash() {
-    //     let sender = @0xabcdef;
-    //     let vault_address = @0xabc;
-    //     let pool_address = @0xabcds;
-    //     let position_key = get_position_key(sender, pool_address, vault_address, true);
+    #[test]
+    fun test_hash() {
+        use std::debug;
 
-    //     assert!(position_key == string::utf8(b"84b2b7e077e62d929eb620ea8e9dbc74c2ee1dd7708199b4aafb34551438121a"), 1);
-    // }
+        let sender = @0xabcd;
+        let vault_address = @0xabcde;
+        let pool_address = @0xabcdef;
+        let position_key = get_position_key(sender, vault_address, pool_address, true);
+        debug::print(&position_key);
+
+        assert!(position_key == string::utf8(b"942bd2693bb9539f585835d472c1ec09bee0275a581a0917828f108373cdc90a"), 1);
+    }
    
 }

@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 module turbos_aum_oracle::aum {
-    use sui::transfer::{Self, transfer, share_object};
-    use sui::object::{Self, ID, UID};
-    use std::option::{Self, Option};
+    use sui::transfer::{transfer, share_object};
+    use sui::object::{Self, UID};
     use sui::tx_context::{Self, TxContext};
 
     struct AUM has key {
@@ -46,7 +45,7 @@ module turbos_aum_oracle::aum {
         aum: &mut AUM,
         amount: u64,
         unix_now: u64,
-        ctx: &mut TxContext,
+        _ctx: &mut TxContext,
     ) {
         aum.amount = amount;
         aum.last_update_time = unix_now;

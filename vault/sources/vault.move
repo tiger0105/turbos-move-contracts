@@ -4,7 +4,6 @@
 module turbos::vault {
     use sui::math;
     use sui::event;
-    use std::vector;
     use sui::transfer;
     use sui::object::{Self, UID, ID};
     use sui::coin::{Self, Coin};
@@ -13,7 +12,7 @@ module turbos::vault {
     use sui::vec_map::{Self, VecMap};
     use sui::dynamic_object_field as dof;
     use turbos::tools;
-    use std::string::{Self, String};
+    use std::string::{String};
     use turbos_time_oracle::time::{Self, Timestamp};
     use turbos_aum_oracle::aum::{Self, AUM};
     use turbos_price_oracle::price::{Self, PriceFeed};
@@ -302,9 +301,11 @@ module turbos::vault {
         adjusted_delta: u64,
     }
 
-    //fun init(_: &mut TxContext) {}
-
     fun init(ctx: &mut TxContext) {
+        init_(ctx);
+    }
+
+    fun init_(ctx: &mut TxContext) {
         transfer::transfer(ManagerCap { id: object::new(ctx) }, tx_context::sender(ctx));
 
         let tlp_supply = balance::create_supply(TLP {});
@@ -339,12 +340,11 @@ module turbos::vault {
            id: object::new(ctx), 
            position_data: vec_map::empty(),
         });
-
     }
 
     entry fun create_pool<T> (
         _: &ManagerCap,
-        vault: &mut Vault, 
+        _vault: &mut Vault, 
         token_decimals: u8,
         min_profit_basis_points: u64,
         is_stable_token: bool,
@@ -486,7 +486,7 @@ module turbos::vault {
         collateral_price_feed: &PriceFeed, 
         positions: &mut Positions,
         token: Coin<T>, 
-        min_out: u64,
+        _min_out: u64, //todo
         size_delta: u64,
         is_long: bool,
         price: u64,
@@ -803,7 +803,6 @@ module turbos::vault {
         update_cumulative_funding_rate<T>(vault, pool, timestamp, ctx);
 
         let price = get_max_price(vault, pool, price_feed);
-        let token_decimals = pool.token_decimals;
 
         let redemption_amount = tusd_amount * PRICE_PRECISION / price;
         assert!(redemption_amount > 0, EInvalidTusdRedemAmount);
@@ -894,7 +893,7 @@ module turbos::vault {
     fun collect_margin_fees<T, P>(
         vault: &Vault,
         collateral_pool: &mut Pool<T>,
-        index_pool: &Pool<P>,
+        _index_pool: &Pool<P>,
         position: &Position,
         size_delta: u64,
         price_feed: &PriceFeed
@@ -947,7 +946,7 @@ module turbos::vault {
         event::emit(DecreaseReservedAmountEvent { pool: object::id(pool), amount: amount});
     }
 
-    fun increase_global_short_size<T>(vault: &Vault, pool: &mut Pool<T>, amount: u64) {
+    fun increase_global_short_size<T>(_vault: &Vault, pool: &mut Pool<T>, amount: u64) {
         pool.global_short_sizes = pool.global_short_sizes + amount;
 
         let max_size = pool.max_global_short_sizes;
@@ -956,7 +955,7 @@ module turbos::vault {
         }
     }
 
-    fun decrease_global_short_size<T>(vault: &Vault, pool: &mut Pool<T>, amount: u64) {
+    fun decrease_global_short_size<T>(_vault: &Vault, pool: &mut Pool<T>, amount: u64) {
         if (amount > pool.global_short_sizes) {
           pool.global_short_sizes = 0;
           return
@@ -987,7 +986,7 @@ module turbos::vault {
         liquidation_fee_usd: u64,
         min_profit_time: u64,
         has_dynamic_fees: bool,
-        ctx: &mut TxContext
+        _ctx: &mut TxContext
     ) {
         assert!(tax_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidTaxBasisPoint);
         assert!(stable_tax_basis_points <= MAX_FEE_BASIS_POINTS, EInvalidStableTaxBasisPoints);
@@ -1014,7 +1013,7 @@ module turbos::vault {
         funding_interval: u64,
         funding_rate_factor: u64,
         stable_funding_rate_factor: u64,
-        ctx: &mut TxContext
+        _ctx: &mut TxContext
     ) {
         assert!(funding_interval >= MIN_FUNDING_RATE_INTERVAL, EInvalidFundingInterval);
         assert!(funding_rate_factor <= MAX_FUNDING_RATE_FACTOR, EInvalidFundingRateFactor);
@@ -1035,7 +1034,7 @@ module turbos::vault {
         is_shortable_token: bool,
         token_weights: u64, 
         max_tusd_amounts: u64,
-        ctx: &mut TxContext
+        _ctx: &mut TxContext
     ) {
         let is_pool_created = dof::exists_<ID>(&vault.id, pool_id);
         assert!(is_pool_created, EPoolNotCreated);
@@ -1127,7 +1126,7 @@ module turbos::vault {
         }
     }
 
-    fun get_next_funding_rate<T>(vault: &Vault, pool: &Pool<T>, timestamp: &Timestamp, ctx: &mut TxContext): u64 {
+    fun get_next_funding_rate<T>(vault: &Vault, pool: &Pool<T>, timestamp: &Timestamp, _ctx: &mut TxContext): u64 {
         let last_funding_times = pool.last_funding_times;
         let funding_interval = vault.funding_interval;
         let current_time = time::unix(timestamp);
@@ -1222,12 +1221,12 @@ module turbos::vault {
         usd_amount * math::pow(10 , decimals) / price
     }
 
-    fun get_min_price<T>(vault: &Vault, pool: &Pool<T>, price_feed: &PriceFeed): u64 {
+    fun get_min_price<T>(_vault: &Vault, _pool: &Pool<T>, price_feed: &PriceFeed): u64 {
         //todo: spread_basis_points
         price::price(price_feed)
     }
 
-    fun get_max_price<T>(vault: &Vault, pool: &Pool<T>, price_feed: &PriceFeed): u64 {
+    fun get_max_price<T>(_vault: &Vault, _pool: &Pool<T>, price_feed: &PriceFeed): u64 {
         //todo: spread_basis_points
         price::price(price_feed)
     }
@@ -1336,11 +1335,42 @@ module turbos::vault {
         let collateral_delta = token_to_usd_min(vault, pool, amount_in, price_feed);
         let next_collateral = collateral + collateral_delta;
 
-        let next_leverage = size * BASIS_POINTS_DIVISOR / collateral;
+        let pre_leverage = size * BASIS_POINTS_DIVISOR / collateral;
         // allow for a maximum of a increasePositionBufferBps decrease since there might be some swap fees taken from the collateral
         let next_leverage = next_size * (BASIS_POINTS_DIVISOR + vault.increase_position_buffer_basis_points) / next_collateral;
 
         // deduct a fee if the leverage is decreased
-        next_leverage < next_leverage
+        next_leverage < pre_leverage
+    }
+
+    // tests
+
+    #[test]
+    public fun test_module_init() {
+        use sui::test_scenario;
+        use std::debug;
+
+        // create test address representing game admin
+        let admin = @0xBABE;
+
+        // first transaction to emulate module initialization
+        let scenario_val = test_scenario::begin(admin);
+        let scenario = &mut scenario_val;
+        {
+            init_(test_scenario::ctx(scenario));
+            debug::print(&admin);
+        };
+        // second transaction to check if the forge has been created
+        // and has initial value of zero swords created
+        // test_scenario::next_tx(scenario, admin);
+        // {
+        //     // extract the Forge object
+        //     let forge = test_scenario::take_from_sender<Forge>(scenario);
+        //     // verify number of created swords
+        //     assert!(swords_created(&forge) == 0, 1);
+        //     // return the Forge object to the object pool
+        //     test_scenario::return_to_sender(scenario, forge);
+        // };
+        test_scenario::end(scenario_val);
     }
 }

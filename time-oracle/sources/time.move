@@ -3,9 +3,8 @@
 
 module turbos_time_oracle::time {
     //! Monotonically increasing timestamping provided by an off-chain oracle.
-    use sui::transfer::{Self, transfer, share_object};
-    use sui::object::{Self, ID, UID};
-    use std::option::{Self, Option};
+    use sui::transfer::{transfer, share_object};
+    use sui::object::{Self, UID};
     use sui::tx_context::{Self, TxContext};
 
     /// Created as a read-only object on every call to `fun stamp`
@@ -55,7 +54,7 @@ module turbos_time_oracle::time {
         _: &mut AuthorityCap,
         timestamp: &mut Timestamp,
         unix_ms_now: u64,
-        ctx: &mut TxContext,
+        _ctx: &mut TxContext,
     ) {
         assert!(unix_ms_now > timestamp.unix_ms, 0);
         timestamp.unix_ms = unix_ms_now;
